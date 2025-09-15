@@ -31,10 +31,10 @@ where residents can access knowledge, administrators can manage with clarity, an
 
 ## 🛠 Tech Stack
 
-- **Spring WebFlux (Kotlin)** – Reactive backend API for dashboarding and management.
-- **Apache StormCrawler + Tika** – Continuous crawling and document parsing (PDF, DOCX, images).
-- **Redis** – Crawl frontier and progression management (targets, state, scheduling).
+- **Python Scrapy + Playwright** – JS-rendered crawling, file detection/downloads; uv-managed environment.
+- **Apache Tika (server)** – MIME detection and robust text/metadata extraction from downloaded files (Docker-compose helper included).
 - **Elasticsearch** – Scalable indexing and semantic search across structured and unstructured data.
+- **Redis** – Frontier/state scheduling (planned integration for large-scale crawling).
 - **AI Agents + RAG** – Retrieval-Augmented Generation layer to answer natural language questions.
 - **Chrome Extension (initial client)** – Residents can install and ask direct questions about their community.
 

@@ -43,12 +43,12 @@ where residents can access knowledge, administrators can manage with clarity, an
 ## 🔄 How It Works
 
 1. **Crawl & Collect**  
-   StormCrawler crawls municipality and school websites, continuously updating without duplication.  
-   Files (PDF, DOCX, images) are parsed by Tika into text and metadata.
+   Scrapy + Playwright crawl municipality and school websites, including JS-rendered pages.  
+   File links are downloaded; Apache Tika extracts MIME, text, and metadata.
 
 2. **Index & Store**  
    Parsed content is indexed in Elasticsearch with change detection.  
-   Redis tracks crawl state and prevents wasteful re-fetching.
+   Redis (planned) will track crawl state and prevent wasteful re-fetching.
 
 3. **Query & Answer**  
    AI agents leverage RAG pipelines to provide precise answers from local data.  
@@ -64,7 +64,7 @@ where residents can access knowledge, administrators can manage with clarity, an
 
 ## 🚀 Roadmap
 
-- [ ] Core crawler + parsing pipeline (StormCrawler + Tika + URLFrontier).
+- [ ] Core crawler + parsing pipeline (Scrapy + Playwright + Tika).
 - [ ] Elasticsearch integration with change-aware indexing.
 - [ ] AI RAG agent prototype over indexed data.
 - [ ] Chrome extension for end-user Q&A.
@@ -89,7 +89,7 @@ This repo includes a Scrapy-based crawler that:
   - `settings.py`: Scrapy and Playwright settings, FilesPipeline, output paths
   - `pipelines.py`: writes content and metadata for each crawled item
   - `spiders/universal.py`: main spider with JS rendering and file detection
-- `requirements.txt`: Python dependencies
+- `pyproject.toml`: Python dependencies and uv configuration
 
 ### Install (uv)
 
@@ -167,7 +167,7 @@ What it does:
 
 Notes:
 
-- If `TIKA_SERVER_URL` is not set, the pipeline is skipped.
+- If `TIKA_SERVER_URL` is not set, the pipeline defaults to `http://localhost:9998` and will log the fallback.
 - You can adjust timeout via `TIKA_TIMEOUT` env var (default 30s).
 - To stop the docker-compose Tika server:
 

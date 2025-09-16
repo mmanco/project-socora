@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 
 # Scrapy settings for socora_crawler project
 
@@ -32,8 +33,9 @@ DEFAULT_REQUEST_HEADERS = {
     ),
 }
 
-# Output base directory
+# Output base directory and run id
 OUTPUT_BASE_DIR = os.getenv("SCRAPY_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
+RUN_ID = os.getenv("RUN_ID", datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S"))
 
 # Enable scrapy-playwright for JS-rendered pages
 DOWNLOAD_HANDLERS = {
@@ -43,7 +45,7 @@ DOWNLOAD_HANDLERS = {
 
 PLAYWRIGHT_BROWSER_TYPE = os.getenv("PLAYWRIGHT_BROWSER_TYPE", "chromium")
 PLAYWRIGHT_LAUNCH_OPTIONS = {
-    "headless": os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false",
+    "headless": False, # os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() != "false",
 }
 PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT = int(os.getenv("PLAYWRIGHT_NAV_TIMEOUT_MS", 30_000))
 
@@ -63,11 +65,23 @@ ITEM_PIPELINES = {
     "socora_crawler.pipelines.OutputWriterPipeline": 900,
 }
 
-# Where to store downloaded files
-FILES_STORE = os.getenv("FILES_STORE", os.path.join(OUTPUT_BASE_DIR, "files"))
+# Where to store downloaded files (scoped by run id by default)
+FILES_STORE = os.getenv("FILES_STORE", os.path.join(OUTPUT_BASE_DIR, "files", RUN_ID))
 
 # Allow reasonable response sizes by default
 DOWNLOAD_MAXSIZE = int(os.getenv("SCRAPY_DOWNLOAD_MAXSIZE", 1024 * 1024 * 64))  # 64MB
 
 # Logging
 LOG_LEVEL = os.getenv("SCRAPY_LOG_LEVEL", "INFO")
+
+# Watchdog to close spider if no progress is made for too long
+EXTENSIONS = {
+    "socora_crawler.extensions.StallWatchdog": 10,
+}
+
+# Configure watchdog via env if needed
+STALL_WATCHDOG_TIMEOUT = int(os.getenv("STALL_WATCHDOG_TIMEOUT", "900"))  # seconds
+STALL_WATCHDOG_INTERVAL = int(os.getenv("STALL_WATCHDOG_INTERVAL", "60"))  # seconds
+
+# Global timeouts to reduce hangs
+DOWNLOAD_TIMEOUT = int(os.getenv("SCRAPY_DOWNLOAD_TIMEOUT", "60"))

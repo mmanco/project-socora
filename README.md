@@ -80,6 +80,7 @@ This repo includes a Scrapy-based crawler that:
 - Renders JavaScript using Playwright to extract post-JS HTML content
 - Detects when a URL points to a file and downloads it
 - Writes out per-URL folders with `content.html` (or `content.txt`) and `metadata.json`
+- Extracts all visible text nodes in DOM order into `text_content.json` with schema `{ "source": <url>, "content": ["text 1", ..., "text N"] }`
 - References downloaded files in the metadata using Scrapy's FilesPipeline
 
 ### Layout
@@ -128,6 +129,122 @@ uv run scrapy crawl universal \
   -a follow_links=true -a max_depth=2 \
   -s SCRAPY_OUTPUT_DIR=./output -s FILES_STORE=./output/files -s ROBOTSTXT_OBEY=true
 ```
+
+### Normalize Extracted Text (Markdown)
+
+Convert a page’s `text_content.json` into clean Markdown using the built‑in normalizer.
+
+Single file:
+
+```
+uv run python -m socora_crawler.normalize_text_content output/run-YYYYmmdd-HHMMSS/<page>/text_content.json > output/run-YYYYmmdd-HHMMSS/<page>/content.md
+```
+
+All pages (bash):
+
+```
+find output -type f -name text_content.json -print0 | while IFS= read -r -d '' f; do \
+  uv run python -m socora_crawler.normalize_text_content "$f" > "$(dirname "$f")/content.md"; \
+done
+```
+
+All pages (PowerShell):
+
+```
+Get-ChildItem -Recurse -Filter text_content.json output | ForEach-Object { \
+  uv run python -m socora_crawler.normalize_text_content $_.FullName | Out-File -FilePath (Join-Path $_.DirectoryName 'content.md') -Encoding utf8 \
+}
+```
+
+Content.md format and behavior:
+
+- Front matter: Each `content.md` starts with YAML including `title`, `url`, `run_id`, and `fetched_at` (sourced from `metadata.json`).
+- Link rendering: Text nodes with captured hrefs are emitted as Markdown links `[text](url)`; links without visible text are skipped.
+- Tables: Data tables are reconstructed as Markdown tables (with header detection), and cell links are clickable.
+- Common text filter: Repeated boilerplate across the run is filtered via a per‑run cache.
+- Missing text: If a page has only `content.txt` (file extraction), `content.md` contains the front matter and the raw text body.
+
+### Workflow
+
+End-to-end sequence for a typical run:
+
+1) Crawl (with optional Tika)
+
+- Start Tika (optional, improves file MIME/text extraction):
+  - Bash: `.containers/tika/run.sh`
+  - Windows: `.containers\tika\run.bat`
+- Run the crawler (examples):
+  - `scripts\run_cresskill.bat` (Windows), or
+  - `uv run scrapy crawl universal -a start_urls="https://example.com" -s SCRAPY_OUTPUT_DIR=./output -s FILES_STORE=./output/files -s ROBOTSTXT_OBEY=false`
+
+2) Normalize page text to Markdown
+
+- Single page: `uv run python -m socora_crawler.normalize_text_content output/run-.../<page>/text_content.json > output/run-.../<page>/content.md`
+- Batch (latest run):
+  - Bash: `scripts/normalize_run.sh`
+  - Windows: `scripts\normalize_run.bat`
+- Notes:
+  - Creates/uses a cross-page cache at `.output/<run-id>/text_commonalities.json` to suppress repetitive boilerplate.
+  - Use `--force-commonalities` to recompute; `--disable-commonalities` to include more plain items; adjust ratio with `--common-threshold` (or env `NORM_COMMON_RATIO`).
+  - Utility words: configurable via env `NORM_UTILITY_WORDS="comma,separated,words"` or `.output/<run-id>/normalize_config.json` (keys: `utility_words` to override; `extra_utility_words` to extend). Defaults are minimal (`home`, `search`).
+
+3) Extract and aggregate links
+
+- Batch extract per-page links and aggregate a run-level JSONL:
+  - Bash: `scripts/extract_links_run.sh output/run-YYYYmmdd-HHMMSS`
+  - Windows: `scripts\extract_links_run.bat output\run-YYYYmmdd-HHMMSS`
+- Outputs:
+  - Per-page `links.json` next to each `text_content.json`
+  - Run-level `.output/<run-id>/links_index.jsonl`
+- Optional per-page link normalization (filters repetitive/common nav):
+  - `uv run python -m socora_crawler.normalize_links output/run-.../<page>/links.json --write`
+  - Uses `.output/<run-id>/text_commonalities.json` if present or `.output/<run-id>/links_commonalities.json` if computed here; adjust with `--common-threshold` (or env `LINK_COMMON_RATIO`).
+  - Notes:
+    - For file-backed pages (no `text_content.json`, only `content.txt`), `links.json` is still produced with `{ isFile: true, page_url, page_title, links: [] }` using `metadata.json`.
+
+### Normalization Configuration
+
+- `.output/<run-id>/normalize_config.json` (optional):
+  - `utility_words`: array of words treated as utility/nav (replaces defaults)
+  - `extra_utility_words`: array to extend defaults
+  - Example:
+    - `{ "utility_words": ["home", "search", "directory"], "extra_utility_words": ["accessibility"] }`
+- Environment variables:
+  - `NORM_UTILITY_WORDS`: comma‑separated utility words
+  - `NORM_COMMON_RATIO`: default ratio for text commonality filtering (e.g., `0.4`)
+  - `LINK_COMMON_RATIO`: default ratio for link commonality filtering
+
+### Run-Level Artifacts
+
+- `output/run-<id>/<page>/`:
+  - `content.html`, `metadata.json`, `text_content.json`, `content.md` (normalized), `links.json` (if extracted)
+- `.output/<run-id>/`:
+  - `text_commonalities.json` (from text normalization)
+  - `links_index.jsonl` (aggregated links across the run)
+  - `links_commonalities.json` (from link normalization, if used)
+
+### Indexing (Overview)
+
+Suggested indices for search systems (e.g., Elasticsearch):
+
+- Pages index
+  - `url` (keyword): page URL
+  - `title` (text): page title
+  - `content_md` (text): normalized Markdown (from `content.md`)
+  - `run_id` (keyword): run identifier
+  - `fetched_at` (date): from `metadata.json`
+
+- Links index
+  - `run_id` (keyword)
+  - `page_url` (keyword)
+  - `page_title` (text)
+  - `link_text` (text)
+  - `href` (keyword)
+  - `heading_path` (keyword, multi-valued): context path of headings
+  - `flags` (object): `isNav`, `isAction`, etc.
+
+Query strategy:
+- For “Where can I find …” questions, query `link_text` first (boost exact/fuzzy matches), then fall back to `content_md` and `title`. Return `href` with heading context from `heading_path`.
 
 ### Optional: Apache Tika Integration
 
@@ -183,8 +300,9 @@ Outputs are written to `output/run-YYYYmmdd-HHMMSS/` with one folder per URL, co
 
 - `content.html` (rendered HTML) or `content.txt` for non-HTML text
 - `metadata.json` with URL, final URL, status, title, timestamp, content type, links, and any downloaded file references
+- `text_content.json` listing text nodes in order of appearance for the page
 
-Downloaded files are stored under `output/files/` by default (override with `-s FILES_STORE=...`). Metadata includes the `files` array generated by the FilesPipeline.
+Downloaded files are stored under `output/files/<RUN_ID>/` by default (override with `-s FILES_STORE=...`). Metadata includes the `files` array; each `path` is prefixed with `<RUN_ID>/...` so it is relative to `output/files/`.
 
 ### Notes and Tips
 
@@ -195,3 +313,4 @@ Downloaded files are stored under `output/files/` by default (override with `-s 
 - To be respectful, `ROBOTSTXT_OBEY` is true in settings by default; pass `-s ROBOTSTXT_OBEY=false` for testing.
 - You can tune concurrency with `-s CONCURRENT_REQUESTS=16` and AutoThrottle settings.
 - The spider checks URL extensions to detect files. If a server serves files without common extensions, you can extend `FILE_EXTENSIONS` in `socora_crawler/spiders/universal.py`.
+ - Stability: A stall watchdog closes the spider if no progress (responses/items) is observed for a configurable period (defaults: 15 min). Configure via `STALL_WATCHDOG_TIMEOUT` and `STALL_WATCHDOG_INTERVAL`. Global `DOWNLOAD_TIMEOUT` and Playwright navigation `timeout` are applied per-request to reduce hangs.

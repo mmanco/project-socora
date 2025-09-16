@@ -9,6 +9,7 @@ import scrapy
 from scrapy.http import Response, Request
 from urllib.parse import urlparse, parse_qs
 from twisted.python.failure import Failure
+from lxml import html as LH
 
 
 FILE_EXTENSIONS = {
@@ -92,16 +93,43 @@ class UniversalSpider(scrapy.Spider):
         if not urls:
             raise scrapy.exceptions.CloseSpider("No start URLs provided. Use -a start_urls=... or -a url_file=...")
 
+        # Auto-include seed domains into allowed list (if user provided one)
+        seed_domains = set()
+        for u in urls:
+            try:
+                host = urlparse(u).netloc.lower()
+                if host:
+                    seed_domains.add(host)
+                    if host.startswith("www."):
+                        seed_domains.add(host[4:])
+            except Exception:
+                pass
+        if self._allowed is not None:
+            # Merge without duplicates
+            merged = set(d.lower() for d in self._allowed)
+            merged.update(seed_domains)
+            self._allowed = sorted(merged)
+
+        nav_timeout_ms = int(self.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT", 30000))
+        download_timeout_sec = max(10, int(nav_timeout_ms / 1000) + 5)
+
         for u in urls:
             if looks_like_file(u):
-                yield scrapy.Request(u, callback=self.parse_file, cb_kwargs={"depth": 0}, dont_filter=True)
+                yield scrapy.Request(
+                    u,
+                    callback=self.parse_file,
+                    cb_kwargs={"depth": 0},
+                    dont_filter=True,
+                    meta={"download_timeout": download_timeout_sec},
+                )
             else:
                 yield scrapy.Request(
                     u,
                     meta={
                         "playwright": True,
                         "playwright_context": "default",
-                        "playwright_page_goto_kwargs": {"wait_until": self._render_wait},
+                        "playwright_page_goto_kwargs": {"wait_until": self._render_wait, "timeout": nav_timeout_ms},
+                        "download_timeout": download_timeout_sec,
                     },
                     callback=self.parse_page,
                     cb_kwargs={"depth": 0},
@@ -133,6 +161,13 @@ class UniversalSpider(scrapy.Spider):
         # Gather links
         links = self._extract_links(response)
 
+        # Timeouts for subsequent requests (avoid NameError by computing locally)
+        nav_timeout_ms = int(self.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT", 30000))
+        download_timeout_sec = max(10, int(nav_timeout_ms / 1000) + 5)
+
+        # Extract visible text nodes in DOM order (excluding scripts/styles and similar)
+        text_nodes = self._extract_text_nodes(response)
+
         item = {
             "url": response.request.url,
             "final_url": response.url,
@@ -142,23 +177,30 @@ class UniversalSpider(scrapy.Spider):
             "title": title,
             "html": html,
             "links": links,
+            "text_nodes": text_nodes,
         }
         yield item
 
         # Follow links if enabled and within depth
         if self._follow and depth < self._max_depth:
             for link in links:
-                if self._allowed and not any(link.startswith(f"http://{d}") or link.startswith(f"https://{d}") for d in self._allowed):
+                if self._allowed and not self._is_allowed_domain(link):
                     continue
                 if looks_like_file(link):
-                    yield scrapy.Request(link, callback=self.parse_file, cb_kwargs={"depth": depth + 1})
+                    yield scrapy.Request(
+                        link,
+                        callback=self.parse_file,
+                        cb_kwargs={"depth": depth + 1},
+                        meta={"download_timeout": download_timeout_sec},
+                    )
                 else:
                     yield scrapy.Request(
                         link,
                         meta={
                             "playwright": True,
                             "playwright_context": "default",
-                            "playwright_page_goto_kwargs": {"wait_until": self._render_wait},
+                            "playwright_page_goto_kwargs": {"wait_until": self._render_wait, "timeout": nav_timeout_ms},
+                            "download_timeout": download_timeout_sec,
                         },
                         callback=self.parse_page,
                         cb_kwargs={"depth": depth + 1},
@@ -217,3 +259,136 @@ class UniversalSpider(scrapy.Spider):
                 uniq.append(u)
                 seen.add(u)
         return uniq
+
+    @staticmethod
+    def _extract_text_nodes(response: Response) -> List[dict]:
+        # Use lxml to ensure stable node identities and accurate xpaths
+        try:
+            doc = LH.fromstring(response.text)
+        except Exception:
+            return []
+
+        bodies = doc.xpath("//body")
+        if not bodies:
+            return []
+        body = bodies[0]
+
+        # Collect text nodes under body, ignoring those inside script/style/etc.
+        text_nodes = body.xpath(
+            ".//text()[normalize-space() and not(ancestor::script or ancestor::style or ancestor::noscript or "
+            "ancestor::svg or ancestor::canvas or ancestor::template or ancestor::code or ancestor::pre)]"
+        )
+
+        def looks_like_css(text: str) -> bool:
+            t = text.strip()
+            if not t:
+                return False
+            if t.startswith("@media") or "@font-face" in t:
+                return True
+            if ("{" in t and "}" in t) and re.search(r"[.#][A-Za-z]", t):
+                return True
+            if re.match(r"^\s*[#.][A-Za-z0-9_-]+\s*\{", t):
+                return True
+            return False
+
+        out: List[dict] = []
+        tree = doc.getroottree()
+
+        def has_class(el, name: str) -> bool:
+            cls = el.get("class") or ""
+            return f" {name} " in f" {cls} "
+
+        def attr_lower(el, key: str) -> str:
+            v = el.get(key)
+            return v.lower() if isinstance(v, str) else ""
+
+        for node in text_nodes:
+            try:
+                s = re.sub(r"\s+", " ", str(node)).strip()
+                if not s:
+                    continue
+                if looks_like_css(s):
+                    continue
+
+                parent = node.getparent()
+                if parent is None:
+                    continue
+                parent_path = tree.getpath(parent)
+                siblings = parent.xpath("text()")
+                pos = 1
+                for i, tnode in enumerate(siblings, start=1):
+                    if tnode is node:
+                        pos = i
+                        break
+                xpath_str = f"{parent_path}/text()[{pos}]"
+
+                # Ascend ancestors for meta flags
+                def has_ancestor(pred) -> bool:
+                    el = parent
+                    while el is not None:
+                        try:
+                            if pred(el):
+                                return True
+                        except Exception:
+                            pass
+                        el = el.getparent()
+                    return False
+
+                is_nav = has_ancestor(lambda el: el.tag.lower() == "nav" or attr_lower(el, "role") == "navigation" or el.tag.lower() == "a")
+                is_title = has_ancestor(lambda el: el.tag.lower() in {"h1","h2","h3","h4","h5","h6"} or attr_lower(el, "role") == "heading")
+                is_par = has_ancestor(lambda el: el.tag.lower() in {"p","li"})
+                # If it's navigation (e.g., anchor text), don't mark as paragraph
+                if is_nav:
+                    is_par = False
+                is_action = has_ancestor(
+                    lambda el: el.tag.lower() == "button" or attr_lower(el, "role") == "button" or (
+                        el.tag.lower() == "input" and attr_lower(el, "type") in {"button","submit","reset"}
+                    ) or has_class(el, "btn")
+                )
+
+                meta = {
+                    "isNav": is_nav,
+                    "isTitle": is_title,
+                    "isParagraph": is_par,
+                    "isAction": is_action,
+                }
+
+                # If navigation text, capture nearest anchor href as absolute URL
+                if is_nav:
+                    try:
+                        el = parent
+                        href_val = None
+                        while el is not None and href_val is None:
+                            if el.tag.lower() == "a":
+                                href_val = el.get("href")
+                                break
+                            el = el.getparent()
+                        if href_val:
+                            href_str = str(href_val).strip()
+                            low = href_str.lower()
+                            if not (low.startswith("javascript:") or low.startswith("mailto:") or low.startswith("tel:") or low.startswith("sms:") or low.startswith("callto:") or href_str.startswith("#")):
+                                meta["href"] = response.urljoin(href_str)
+                    except Exception:
+                        pass
+
+                out.append({
+                    "xpath": xpath_str,
+                    "content": s,
+                    "meta": meta,
+                })
+            except Exception:
+                continue
+        return out
+
+    def _is_allowed_domain(self, url: str) -> bool:
+        try:
+            host = urlparse(url).netloc.lower()
+            if not host:
+                return False
+            for d in self._allowed or []:
+                d = d.lower()
+                if host == d or host.endswith("." + d):
+                    return True
+            return False
+        except Exception:
+            return False

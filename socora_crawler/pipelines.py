@@ -30,8 +30,14 @@ class OutputWriterPipeline:
         base = getattr(spider.settings, "OUTPUT_BASE_DIR", None)
         if not base:
             base = os.getenv("SCRAPY_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
-        ts = datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S")
-        self.run_dir = Path(base) / ts
+        run_id = getattr(spider.settings, "RUN_ID", None) or datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S")
+        self.run_dir = Path(base) / run_id
+        self.run_id = run_id
+        # Expose on spider for other components (if needed)
+        try:
+            setattr(spider, "run_id", run_id)
+        except Exception:
+            pass
         self.run_dir.mkdir(parents=True, exist_ok=True)
         spider.logger.info(f"Writing outputs to: {self.run_dir}")
 
@@ -51,6 +57,15 @@ class OutputWriterPipeline:
         elif text:
             (target_dir / "content.txt").write_text(text, encoding="utf-8")
 
+        # Write structured text nodes (ordered by appearance)
+        if data.get("text_nodes") and isinstance(data["text_nodes"], list):
+            text_doc = {
+                "source": data.get("final_url") or data.get("url"),
+                "content": data["text_nodes"],
+            }
+            with (target_dir / "text_content.json").open("w", encoding="utf-8") as f:
+                json.dump(text_doc, f, ensure_ascii=False, indent=2)
+
         # Prepare metadata
         metadata = {
             "url": data.get("url"),
@@ -65,7 +80,18 @@ class OutputWriterPipeline:
 
         # Reference downloaded files from FilesPipeline
         if data.get("files"):
-            metadata["files"] = data["files"]
+            # Prefix run_id so paths are relative to output/files/<run_id>
+            prefixed = []
+            for f in data["files"]:
+                try:
+                    d = dict(f)
+                    p = d.get("path")
+                    if isinstance(p, str) and self.run_id:
+                        d["path"] = f"{self.run_id}/{p}"
+                    prefixed.append(d)
+                except Exception:
+                    prefixed.append(f)
+            metadata["files"] = prefixed
         elif data.get("file_urls"):
             # If FilesPipeline is disabled, still record intended file URLs
             metadata["file_urls"] = data["file_urls"]

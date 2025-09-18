@@ -1,0 +1,45 @@
+﻿{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run/Debug Cresskill Crawler",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "module": "scrapy",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "crawl",
+        "universal",
+        "-a", "start_urls=${input:startUrls}",
+        "-a", "allowed=${input:allowedDomains}",
+        "-a", "follow_links=true",
+        "-a", "max_depth=${input:maxDepth}",
+        "-s", "ROBOTSTXT_OBEY=true",
+        "-s", "SCRAPY_OUTPUT_DIR=./output"
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "startUrls",
+      "type": "promptString",
+      "description": "Seed URLs (comma-separated)",
+      "default": "https://www.cresskillboro.com"
+    },
+    {
+      "id": "allowedDomains",
+      "type": "promptString",
+      "description": "Allowed domains (comma-separated)",
+      "default": "edmundsassoc.com,edmundsgovtech.cloud,cresskilllibrary.org,bergencountynj.gov"
+    },
+    {
+      "id": "maxDepth",
+      "type": "promptString",
+      "description": "Maximum crawl depth",
+      "default": "8"
+    }
+  ]
+}

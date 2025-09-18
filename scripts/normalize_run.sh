@@ -40,16 +40,16 @@ echo "Normalizing run: ${RUN_DIR}"
 
 export PYTHONIOENCODING=utf-8
 
-# Process each page directory once, preferring text_content.json over content.txt
+# Process each page directory once, preferring content.json over content.txt
 while IFS= read -r -d '' d; do
-  if [[ -f "$d/text_content.json" ]]; then
-    echo "- $d/text_content.json"
-    uv run python -m socora_crawler.normalize_text_content "$d/text_content.json" "$@" > "$d/content.md"
+  if [[ -f "$d/content.json" ]]; then
+    echo "- $d/content.json"
+    uv run python -m socora_crawler.normalize_text_content "$d/content.json" "$@" > "$d/content.md"
   elif [[ -f "$d/content.txt" ]]; then
     echo "- $d/content.txt"
     uv run python -m socora_crawler.normalize_text_content "$d/content.txt" "$@" > "$d/content.md"
   else
-    echo "[WARN] Missing text_content.json and content.txt: $d"
+    echo "[WARN] Missing content.json and content.txt: $d"
   fi
 done < <(find "${RUN_DIR}" -mindepth 1 -maxdepth 1 -type d -print0)
 

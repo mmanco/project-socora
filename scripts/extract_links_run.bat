@@ -41,14 +41,14 @@ if "%RUN_DIR%"=="" (
 
 echo Extracting links for run: %RUN_DIR%
 for /d %%D in ("%RUN_DIR%\*") do (
-  if exist "%%D\text_content.json" (
-    echo - %%D\text_content.json
-    uv run python -m socora_crawler.extract_links "%%D\text_content.json" --write >nul
+  if exist "%%D\content.json" (
+    echo - %%D\content.json
+    uv run python -m socora_crawler.extract_links "%%D\content.json" --write >nul
   ) else if exist "%%D\content.txt" (
     echo - %%D\content.txt
     uv run python -m socora_crawler.extract_links "%%D\content.txt" --write >nul
   ) else (
-    echo - %%D (no text files; using metadata)
+    echo - %%D (no content files; using metadata)
     uv run python -m socora_crawler.extract_links "%%D" --write >nul
   )
 )

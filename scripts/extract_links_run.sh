@@ -30,14 +30,14 @@ fi
 echo "Extracting links for run: ${RUN_DIR}"
 # Iterate page directories; prefer text_content.json else content.txt; else skip
 find "${RUN_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -r -d '' d; do
-  if [[ -f "$d/text_content.json" ]]; then
-    echo "- $d/text_content.json"
-    uv run python -m socora_crawler.extract_links "$d/text_content.json" --write >/dev/null
+  if [[ -f "$d/content.json" ]]; then
+    echo "- $d/content.json"
+    uv run python -m socora_crawler.extract_links "$d/content.json" --write >/dev/null
   elif [[ -f "$d/content.txt" ]]; then
     echo "- $d/content.txt"
     uv run python -m socora_crawler.extract_links "$d/content.txt" --write >/dev/null
   else
-    echo "- $d (no text files; using metadata)"
+    echo "- $d (no content files; using metadata)"
     uv run python -m socora_crawler.extract_links "$d" --write >/dev/null
   fi
 done

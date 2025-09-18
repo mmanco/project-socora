@@ -59,14 +59,14 @@ echo Normalizing run: %RUN_DIR%
 
 REM Iterate page directories once; prefer text_content.json over content.txt; warn if both missing
 for /d %%D in ("%RUN_DIR%\*") do (
-  if exist "%%D\text_content.json" (
-    echo - %%D\text_content.json
-    uv run python -m socora_crawler.normalize_text_content "%%D\text_content.json" %EXTRA_ARGS% > "%%D\content.md"
+  if exist "%%D\content.json" (
+    echo - %%D\content.json
+    uv run python -m socora_crawler.normalize_text_content "%%D\content.json" %EXTRA_ARGS% > "%%D\content.md"
   ) else if exist "%%D\content.txt" (
     echo - %%D\content.txt
     uv run python -m socora_crawler.normalize_text_content "%%D\content.txt" %EXTRA_ARGS% > "%%D\content.md"
   ) else (
-    echo [WARN] Missing text_content.json and content.txt: %%D
+    echo [WARN] Missing content.json and content.txt: %%D
   )
 )
 

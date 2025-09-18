@@ -14,7 +14,7 @@ def _load_json(path: Path) -> Dict:
 
 def extract_links(text_doc: Dict, *, input_path: Optional[Path] = None) -> Dict:
     """
-    Build a per-page links sidecar from a text_content.json document produced by the crawler.
+    Build a per-page links sidecar from a content.json document produced by the crawler.
 
     Output schema:
     {
@@ -26,7 +26,7 @@ def extract_links(text_doc: Dict, *, input_path: Optional[Path] = None) -> Dict:
           "href": str,
           "heading_path": [str, ...],
           "xpath": str|None,
-          "flags": {"isNav": bool, "isAction": bool, "isParagraph": bool, "isTitle": bool}
+          "flags": {"isNav": bool, "isAction": bool, "isParagraph": bool, "isTitle": bool, "isEmbed": bool}
         }, ...
       ]
     }
@@ -47,28 +47,31 @@ def extract_links(text_doc: Dict, *, input_path: Optional[Path] = None) -> Dict:
 
     heading_path: List[str] = []
     for it in text_doc.get("content") or []:
-        text = (it.get("content") or "").strip()
-        if not text:
-            continue
         meta = it.get("meta") or {}
+        text = (it.get("content") or "").strip()
         # Track headings in order of appearance
-        if meta.get("isTitle") and text not in heading_path:
-            heading_path.append(text)
+        if meta.get("isTitle") and text:
+            if text not in heading_path:
+                heading_path.append(text)
             continue
-        href = meta.get("href")
-        if href:
-            links.append({
-                "text": text,
-                "href": href,
-                "heading_path": list(heading_path),
-                "xpath": it.get("xpath"),
-                "flags": {
-                    "isNav": bool(meta.get("isNav")),
-                    "isAction": bool(meta.get("isAction")),
-                    "isParagraph": bool(meta.get("isParagraph")),
-                    "isTitle": bool(meta.get("isTitle")),
-                },
-            })
+        href = (meta.get("href") or "").strip()
+        if meta.get("isEmbed") and not text and href:
+            text = href
+        if not text or not href:
+            continue
+        links.append({
+            "text": text,
+            "href": href,
+            "heading_path": list(heading_path),
+            "xpath": it.get("xpath"),
+            "flags": {
+                "isNav": bool(meta.get("isNav")),
+                "isAction": bool(meta.get("isAction")),
+                "isParagraph": bool(meta.get("isParagraph")),
+                "isTitle": bool(meta.get("isTitle")),
+                "isEmbed": bool(meta.get("isEmbed")),
+            },
+        })
 
     return {"page_url": page_url, "page_title": page_title, "links": links}
 
@@ -90,8 +93,8 @@ def _file_page_links(input_path: Path) -> Dict:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Extract links from a text_content.json into links.json structure")
-    p.add_argument("input", help="Path to text_content.json")
+    p = argparse.ArgumentParser(description="Extract links from a content.json (or content.txt/page dir) into links.json structure")
+    p.add_argument("input", help="Path to content.json | content.txt | page directory")
     p.add_argument("--write", action="store_true", help="Write to sibling links.json instead of stdout")
     args = p.parse_args(argv)
 

@@ -3,8 +3,9 @@ from __future__ import annotations
 import mimetypes
 import re
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional
+from typing import Any, AsyncIterator, Iterable, List, Optional
 
+import asyncio
 import scrapy
 from scrapy.http import Response, Request
 from urllib.parse import urlparse, parse_qs
@@ -79,8 +80,18 @@ class UniversalSpider(scrapy.Spider):
         self._follow = follow_links.lower() != "false"
         self._max_depth = int(max_depth)
         self._render_wait = render_wait
+        self._max_playwright_retries = 4
 
-    def start_requests(self) -> Iterable[Request]:
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        spider._apply_settings(crawler.settings)
+        return spider
+
+    def _apply_settings(self, settings):
+        self._max_playwright_retries = int(settings.getint("RETRY_TIMES", 4))
+
+    def _iter_start_requests(self) -> Iterable[Request]:
         urls: List[str] = []
         if self._start_urls_arg:
             urls.extend([u.strip() for u in self._start_urls_arg.split(",") if u.strip()])
@@ -128,8 +139,11 @@ class UniversalSpider(scrapy.Spider):
                     meta={
                         "playwright": True,
                         "playwright_context": "default",
+                        "playwright_include_page": True,
                         "playwright_page_goto_kwargs": {"wait_until": self._render_wait, "timeout": nav_timeout_ms},
                         "download_timeout": download_timeout_sec,
+                        "playwright_retry_times": 0,
+                        "playwright_max_retries": self._max_playwright_retries,
                     },
                     callback=self.parse_page,
                     cb_kwargs={"depth": 0},
@@ -137,10 +151,37 @@ class UniversalSpider(scrapy.Spider):
                     dont_filter=True,
                 )
 
-    def parse_file(self, response: Response, depth: int) -> Optional[dict]:
-        # Hand off to FilesPipeline by populating file_urls
+    def start_requests(self) -> Iterable[Request]:
+        yield from self._iter_start_requests()
+
+    async def start(self) -> AsyncIterator[Request]:
+        for req in self._iter_start_requests():
+            yield req
+
+    def parse_file(self, response: Response, depth: int) -> Any:
         content_type = response.headers.get("Content-Type", b"").decode("latin-1")
         status = response.status
+
+        if self._should_treat_response_as_html(content_type, response.body):
+            html = response.text or ""
+            if html.strip():
+                title = self._extract_title(html)
+                links = self._extract_links(response)
+                text_nodes = self._extract_text_nodes(response)
+                embeds = self._extract_iframes(response)
+                self.logger.debug(f"Treating file-like response as HTML page: {response.url}")
+                normalized_content_type = content_type if "html" in (content_type or "").lower() else "text/html"
+                return self._build_page_results(
+                    response=response,
+                    depth=depth,
+                    html=html,
+                    content_type=normalized_content_type,
+                    title=title,
+                    links=links,
+                    content_blocks=text_nodes + embeds,
+                    screenshot_bytes=None,
+                )
+
         item = {
             "url": response.request.url,
             "final_url": response.url,
@@ -152,22 +193,78 @@ class UniversalSpider(scrapy.Spider):
         }
         return item
 
-    def parse_page(self, response: Response, depth: int):
-        # Extract rendered page content
+    def _should_treat_response_as_html(self, content_type: str, body: bytes) -> bool:
+        ctype = (content_type or "").lower()
+        if "text/html" in ctype or "application/xhtml" in ctype:
+            return True
+        if not body:
+            return False
+        sample = body[:4096].lstrip()
+        if not sample:
+            return False
+        lowered = sample.lower()
+        if lowered.startswith(b"<!doctype html") or lowered.startswith(b"<html"):
+            return True
+        if lowered.startswith(b"<?xml"):
+            parts = lowered.split(b">", 1)
+            if len(parts) == 2:
+                tail = parts[1].lstrip().lower()
+                if tail.startswith(b"<!doctype html") or tail.startswith(b"<html"):
+                    return True
+        if b"<html" in lowered:
+            return True
+        if lowered.startswith(b"<head") or lowered.startswith(b"<body"):
+            return True
+        return False
+
+    async def parse_page(self, response: Response, depth: int):
+        page = response.meta.get("playwright_page")
+        screenshot_bytes = None
+        if page is not None:
+            try:
+                screenshot_bytes = await page.screenshot(full_page=True, type="png")
+            except Exception as exc:
+                self.logger.warning(f"Screenshot capture failed for {response.url}: {exc}")
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
         html = response.text or ""
         title = self._extract_title(html)
         content_type = response.headers.get("Content-Type", b"").decode("latin-1")
 
-        # Gather links
         links = self._extract_links(response)
 
-        # Timeouts for subsequent requests (avoid NameError by computing locally)
-        nav_timeout_ms = int(self.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT", 30000))
-        download_timeout_sec = max(10, int(nav_timeout_ms / 1000) + 5)
-
-        # Extract visible text nodes in DOM order (excluding scripts/styles and similar)
         text_nodes = self._extract_text_nodes(response)
+        embeds = self._extract_iframes(response)
 
+        content_blocks = text_nodes + embeds
+
+        return self._build_page_results(
+            response=response,
+            depth=depth,
+            html=html,
+            content_type=content_type or "text/html",
+            title=title,
+            links=links,
+            content_blocks=content_blocks,
+            screenshot_bytes=screenshot_bytes,
+        )
+
+    def _build_page_results(
+        self,
+        response: Response,
+        depth: int,
+        html: str,
+        content_type: str,
+        title: Optional[str],
+        links: List[str],
+        content_blocks: List[Any],
+        screenshot_bytes: Optional[bytes] = None,
+    ) -> List[Any]:
+        results: List[Any] = []
         item = {
             "url": response.request.url,
             "final_url": response.url,
@@ -177,35 +274,47 @@ class UniversalSpider(scrapy.Spider):
             "title": title,
             "html": html,
             "links": links,
-            "text_nodes": text_nodes,
+            "content": content_blocks,
         }
-        yield item
+        if screenshot_bytes:
+            item["screenshot"] = screenshot_bytes
+        results.append(item)
 
-        # Follow links if enabled and within depth
+        nav_timeout_ms = int(self.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT", 30000))
+        download_timeout_sec = max(10, int(nav_timeout_ms / 1000) + 5)
+
         if self._follow and depth < self._max_depth:
             for link in links:
                 if self._allowed and not self._is_allowed_domain(link):
                     continue
                 if looks_like_file(link):
-                    yield scrapy.Request(
-                        link,
-                        callback=self.parse_file,
-                        cb_kwargs={"depth": depth + 1},
-                        meta={"download_timeout": download_timeout_sec},
+                    results.append(
+                        scrapy.Request(
+                            link,
+                            callback=self.parse_file,
+                            cb_kwargs={"depth": depth + 1},
+                            meta={"download_timeout": download_timeout_sec},
+                        )
                     )
                 else:
-                    yield scrapy.Request(
-                        link,
-                        meta={
-                            "playwright": True,
-                            "playwright_context": "default",
-                            "playwright_page_goto_kwargs": {"wait_until": self._render_wait, "timeout": nav_timeout_ms},
-                            "download_timeout": download_timeout_sec,
-                        },
-                        callback=self.parse_page,
-                        cb_kwargs={"depth": depth + 1},
-                        errback=self.on_request_error,
+                    results.append(
+                        scrapy.Request(
+                            link,
+                            meta={
+                                "playwright": True,
+                                "playwright_context": "default",
+                                "playwright_include_page": True,
+                                "playwright_page_goto_kwargs": {"wait_until": self._render_wait, "timeout": nav_timeout_ms},
+                                "download_timeout": download_timeout_sec,
+                                "playwright_retry_times": 0,
+                                "playwright_max_retries": self._max_playwright_retries,
+                            },
+                            callback=self.parse_page,
+                            cb_kwargs={"depth": depth + 1},
+                            errback=self.on_request_error,
+                        )
                     )
+        return results
 
     def on_request_error(self, failure: Failure):
         request = failure.request
@@ -215,13 +324,46 @@ class UniversalSpider(scrapy.Spider):
             depth = int((request.cb_kwargs or {}).get('depth', 0))
         except Exception:
             pass
+
+        page = request.meta.pop("playwright_page", None) if request.meta else None
+        if page is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop()
+                except Exception:
+                    loop = None
+            if loop is not None:
+                try:
+                    loop.create_task(page.close())
+                except Exception:
+                    pass
+
         msg = str(failure.value)
         # If Playwright navigation triggers a download, retry as a direct file request
         if 'Download is starting' in msg or 'download is starting' in msg:
             self.logger.info(f"Retrying as file due to download start: {url}")
             return scrapy.Request(url, callback=self.parse_file, cb_kwargs={'depth': depth}, dont_filter=True)
-        # Propagate other errors by logging; returning None drops the request
-        self.logger.warning(f"Playwright request failed: {msg} for {url}")
+
+        if request.meta and request.meta.get('playwright'):
+            retry_times = int(request.meta.get('playwright_retry_times', 0))
+            max_retries = int(request.meta.get('playwright_max_retries', self._max_playwright_retries))
+            if retry_times < max_retries:
+                new_meta = dict(request.meta)
+                new_meta.pop('playwright_page', None)
+                new_meta['playwright_retry_times'] = retry_times + 1
+                new_meta.setdefault('playwright_max_retries', max_retries)
+                self.logger.warning(
+                    f"Playwright request failed (attempt {retry_times + 1}/{max_retries}) for {url}: {msg}. Retrying..."
+                )
+                return request.replace(meta=new_meta, dont_filter=True)
+            else:
+                self.logger.error(
+                    f"Playwright request exhausted {retry_times} retries for {url}. Last error: {msg}"
+                )
+        else:
+            self.logger.warning(f"Playwright request failed: {msg} for {url}")
 
     @staticmethod
     def _extract_title(html: str) -> Optional[str]:
@@ -392,3 +534,57 @@ class UniversalSpider(scrapy.Spider):
             return False
         except Exception:
             return False
+
+    @staticmethod
+    def _extract_iframes(response: Response) -> List[dict]:
+        out: List[dict] = []
+        try:
+            sels = response.xpath("//iframe[@src]")
+            for sel in sels:
+                try:
+                    src = sel.xpath("@src").get() or ""
+                    src = src.strip()
+                    if not src:
+                        continue
+                    href = response.urljoin(src)
+                    # Detect platform by hostname
+                    platform = UniversalSpider._detect_embed_platform(href)
+                    # Compute element xpath
+                    xpath_str = None
+                    try:
+                        el = sel.root
+                        xpath_str = el.getroottree().getpath(el)
+                    except Exception:
+                        xpath_str = "//iframe"
+                    out.append({
+                        "xpath": xpath_str,
+                        "content": href,
+                        "meta": {
+                            "isEmbed": True,
+                            "href": href,
+                            "platform": platform,
+                        },
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _detect_embed_platform(href: str) -> str:
+        try:
+            host = urlparse(href).netloc.lower()
+        except Exception:
+            return "other"
+        if any(h in host for h in ("youtube.com", "youtu.be")):
+            return "youtube"
+        if "instagram.com" in host:
+            return "instagram"
+        if "pinterest." in host:
+            return "pinterest"
+        if "tiktok.com" in host:
+            return "tiktok"
+        if "twitter.com" in host or host.endswith(".x.com") or host == "x.com":
+            return "x"
+        return "other"

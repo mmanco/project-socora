@@ -157,7 +157,80 @@ def _find_repo_root(start: Path) -> Path:
 
 
 def _enumerate_text_content_files(run_root: Path) -> List[Path]:
-    return sorted(run_root.rglob("text_content.json"))
+    return sorted(run_root.rglob("content.json"))
+
+
+def _infer_crawler_depth(run_root: Path) -> Optional[int]:
+    env_vars = [
+        "NORM_CRAWLER_DEPTH",
+        "CRAWLER_DEPTH",
+        "CRAWLER_MAX_DEPTH",
+        "MAX_DEPTH",
+    ]
+    for var in env_vars:
+        val = os.getenv(var)
+        if not val:
+            continue
+        try:
+            depth = int(val)
+        except (TypeError, ValueError):
+            continue
+        if depth >= 0:
+            return depth
+    repo_root = _find_repo_root(run_root)
+    candidate_files = [
+        repo_root / ".output" / run_root.name / "normalize_config.json",
+        repo_root / ".output" / run_root.name / "run_config.json",
+        run_root / "normalize_config.json",
+        run_root / "run_config.json",
+        run_root / "crawl_config.json",
+        run_root / "run_meta.json",
+    ]
+    keys = ("crawler_depth", "max_depth", "depth", "maxDepth", "crawl_depth", "crawlerDepth")
+    for cfg_path in candidate_files:
+        try:
+            if not cfg_path.exists():
+                continue
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            for key in keys:
+                if key in data:
+                    val = data.get(key)
+                    try:
+                        depth = int(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if depth >= 0:
+                        return depth
+    return None
+
+
+def _prune_commonalities_by_depth(commons: Dict, depth: Optional[int]) -> Dict:
+    if not isinstance(commons, dict):
+        return commons
+    if depth is None:
+        return commons
+    try:
+        threshold = int(depth)
+    except (TypeError, ValueError):
+        return commons
+    if threshold < 0:
+        return commons
+    for key in ("text_page_freq", "nav_text_page_freq", "action_text_page_freq"):
+        freq_map = commons.get(key)
+        if isinstance(freq_map, dict):
+            commons[key] = {k: v for k, v in freq_map.items() if _safe_int(v) > threshold}
+    commons["crawler_depth"] = threshold
+    return commons
+
+
+def _safe_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _compute_commonalities(run_root: Path) -> Dict:
@@ -205,6 +278,8 @@ def _compute_commonalities(run_root: Path) -> Dict:
         "nav_text_page_freq": {k: len(v) for k, v in nav_text_to_pages.items()},
         "action_text_page_freq": {k: len(v) for k, v in action_text_to_pages.items()},
     }
+    depth = _infer_crawler_depth(run_root)
+    commons = _prune_commonalities_by_depth(commons, depth if depth is not None else commons.get("crawler_depth"))
     return commons
 
 
@@ -219,7 +294,19 @@ def _load_or_build_commonalities(input_path: Path, force: bool = False) -> Optio
     if cache_file.exists() and not force:
         try:
             with cache_file.open("r", encoding="utf-8") as fh:
-                return json.load(fh)
+                cached = json.load(fh)
+            if not isinstance(cached, dict):
+                return cached
+            inferred_depth = _infer_crawler_depth(run_root)
+            depth_to_use = inferred_depth if inferred_depth is not None else cached.get("crawler_depth")
+            cached = _prune_commonalities_by_depth(cached, depth_to_use)
+            if depth_to_use is not None:
+                try:
+                    with cache_file.open("w", encoding="utf-8") as fh:
+                        json.dump(cached, fh, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            return cached
         except Exception:
             pass
     commons = _compute_commonalities(run_root)
@@ -531,8 +618,8 @@ def _load_json_file(path: str) -> Dict:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Normalize a text_content.json into Markdown content")
-    parser.add_argument("input", help="Path to text_content.json (or - for stdin)")
+    parser = argparse.ArgumentParser(description="Normalize a content.json or content.txt into Markdown content")
+    parser.add_argument("input", help="Path to content.json or content.txt (or - for stdin)")
     parser.add_argument("--force-commonalities", action="store_true", help="Recompute cross-page commonalities cache for this run")
     parser.add_argument("--common-threshold", type=float, default=None, help="Ratio [0,1] above which strings are considered common and excluded (default 0.4 or NORM_COMMON_RATIO env)")
     parser.add_argument("--disable-commonalities", action="store_true", help="Disable cross-page commonality filtering (include all items that pass other gates)")

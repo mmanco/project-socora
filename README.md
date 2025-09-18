@@ -80,7 +80,8 @@ This repo includes a Scrapy-based crawler that:
 - Renders JavaScript using Playwright to extract post-JS HTML content
 - Detects when a URL points to a file and downloads it
 - Writes out per-URL folders with `content.html` (or `content.txt`) and `metadata.json`
-- Extracts all visible text nodes in DOM order into `text_content.json` with schema `{ "source": <url>, "content": ["text 1", ..., "text N"] }`
+- Extracts all visible content nodes in DOM order into `content.json` with schema `{ "source": <url>, "content": [ { xpath, content, meta } ] }`. 
+  Also captures embedded iframes as items with `meta.isEmbed=true`, `meta.href=<resolved src>`, and `meta.platform` inferred from the embed host (youtube, instagram, pinterest, x, tiktok, other).
 - References downloaded files in the metadata using Scrapy's FilesPipeline
 
 ### Layout
@@ -132,18 +133,18 @@ uv run scrapy crawl universal \
 
 ### Normalize Extracted Text (Markdown)
 
-Convert a page’s `text_content.json` into clean Markdown using the built‑in normalizer.
+Convert a page’s `content.json` into clean Markdown using the built‑in normalizer.
 
 Single file:
 
 ```
-uv run python -m socora_crawler.normalize_text_content output/run-YYYYmmdd-HHMMSS/<page>/text_content.json > output/run-YYYYmmdd-HHMMSS/<page>/content.md
+uv run python -m socora_crawler.normalize_text_content output/run-YYYYmmdd-HHMMSS/<page>/content.json > output/run-YYYYmmdd-HHMMSS/<page>/content.md
 ```
 
 All pages (bash):
 
 ```
-find output -type f -name text_content.json -print0 | while IFS= read -r -d '' f; do \
+find output -type f -name content.json -print0 | while IFS= read -r -d '' f; do \
   uv run python -m socora_crawler.normalize_text_content "$f" > "$(dirname "$f")/content.md"; \
 done
 ```
@@ -151,7 +152,7 @@ done
 All pages (PowerShell):
 
 ```
-Get-ChildItem -Recurse -Filter text_content.json output | ForEach-Object { \
+Get-ChildItem -Recurse -Filter content.json output | ForEach-Object { \
   uv run python -m socora_crawler.normalize_text_content $_.FullName | Out-File -FilePath (Join-Path $_.DirectoryName 'content.md') -Encoding utf8 \
 }
 ```
@@ -179,7 +180,7 @@ End-to-end sequence for a typical run:
 
 2) Normalize page text to Markdown
 
-- Single page: `uv run python -m socora_crawler.normalize_text_content output/run-.../<page>/text_content.json > output/run-.../<page>/content.md`
+- Single page: `uv run python -m socora_crawler.normalize_text_content output/run-.../<page>/content.json > output/run-.../<page>/content.md`
 - Batch (latest run):
   - Bash: `scripts/normalize_run.sh`
   - Windows: `scripts\normalize_run.bat`
@@ -194,7 +195,7 @@ End-to-end sequence for a typical run:
   - Bash: `scripts/extract_links_run.sh output/run-YYYYmmdd-HHMMSS`
   - Windows: `scripts\extract_links_run.bat output\run-YYYYmmdd-HHMMSS`
 - Outputs:
-  - Per-page `links.json` next to each `text_content.json`
+  - Per-page `links.json` next to each `content.json`
   - Run-level `.output/<run-id>/links_index.jsonl`
 - Optional per-page link normalization (filters repetitive/common nav):
   - `uv run python -m socora_crawler.normalize_links output/run-.../<page>/links.json --write`
@@ -217,7 +218,7 @@ End-to-end sequence for a typical run:
 ### Run-Level Artifacts
 
 - `output/run-<id>/<page>/`:
-  - `content.html`, `metadata.json`, `text_content.json`, `content.md` (normalized), `links.json` (if extracted)
+  - `content.html`, `metadata.json`, `content.json`, `content.md` (normalized), `links.json` (if extracted)
 - `.output/<run-id>/`:
   - `text_commonalities.json` (from text normalization)
   - `links_index.jsonl` (aggregated links across the run)
@@ -300,7 +301,7 @@ Outputs are written to `output/run-YYYYmmdd-HHMMSS/` with one folder per URL, co
 
 - `content.html` (rendered HTML) or `content.txt` for non-HTML text
 - `metadata.json` with URL, final URL, status, title, timestamp, content type, links, and any downloaded file references
-- `text_content.json` listing text nodes in order of appearance for the page
+- `content.json` listing content elements (text nodes and embeds) in order of appearance for the page
 
 Downloaded files are stored under `output/files/<RUN_ID>/` by default (override with `-s FILES_STORE=...`). Metadata includes the `files` array; each `path` is prefixed with `<RUN_ID>/...` so it is relative to `output/files/`.
 

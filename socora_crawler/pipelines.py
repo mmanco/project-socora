@@ -27,10 +27,29 @@ class OutputWriterPipeline:
     """
 
     def open_spider(self, spider):
-        base = getattr(spider.settings, "OUTPUT_BASE_DIR", None)
-        if not base:
-            base = os.getenv("SCRAPY_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
-        run_id = getattr(spider.settings, "RUN_ID", None) or datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S")
+        settings = spider.settings
+        base = settings.get("OUTPUT_BASE_DIR") or os.getenv("SCRAPY_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
+        run_id = settings.get("RUN_ID")
+        if not run_id:
+            files_store = settings.get("FILES_STORE")
+            if files_store:
+                try:
+                    fs_path = Path(files_store)
+                    candidates = [fs_path.name]
+                    if fs_path.parent:
+                        candidates.append(fs_path.parent.name)
+                    for candidate in candidates:
+                        if candidate and candidate.lower() != 'files':
+                            run_id = candidate
+                            break
+                except Exception:
+                    pass
+        if not run_id:
+            run_id = datetime.now(timezone.utc).strftime("run-%Y%m%d-%H%M%S")
+        try:
+            settings.set("RUN_ID", run_id, priority="spider")
+        except Exception:
+            pass
         self.run_dir = Path(base) / run_id
         self.run_id = run_id
         # Expose on spider for other components (if needed)
@@ -57,14 +76,41 @@ class OutputWriterPipeline:
         elif text:
             (target_dir / "content.txt").write_text(text, encoding="utf-8")
 
-        # Write structured text nodes (ordered by appearance)
-        if data.get("text_nodes") and isinstance(data["text_nodes"], list):
-            text_doc = {
+        # Write structured content elements (text nodes, embeds, etc.)
+        content_list = None
+        if isinstance(data.get("content"), list):
+            content_list = data.get("content")
+        elif isinstance(data.get("text_nodes"), list):
+            # Backward compatibility
+            content_list = data.get("text_nodes")
+        if content_list is not None:
+            content_doc = {
                 "source": data.get("final_url") or data.get("url"),
-                "content": data["text_nodes"],
+                "content": content_list,
             }
-            with (target_dir / "text_content.json").open("w", encoding="utf-8") as f:
-                json.dump(text_doc, f, ensure_ascii=False, indent=2)
+            with (target_dir / "content.json").open("w", encoding="utf-8") as f:
+                json.dump(content_doc, f, ensure_ascii=False, indent=2)
+
+        screenshot_bytes = data.get("screenshot")
+        screenshot_rel = None
+        if isinstance(screenshot_bytes, (bytes, bytearray)):
+            screenshot_path = target_dir / "screenshot.png"
+            try:
+                screenshot_path.write_bytes(bytes(screenshot_bytes))
+                screenshot_rel = "screenshot.png"
+            except Exception as exc:
+                spider.logger.warning(f"Failed to write screenshot for {url}: {exc}")
+
+        if screenshot_rel:
+            try:
+                item["screenshot"] = screenshot_rel
+            except Exception:
+                pass
+        elif "screenshot" in data:
+            try:
+                del item["screenshot"]
+            except Exception:
+                pass
 
         # Prepare metadata
         metadata = {
@@ -77,6 +123,8 @@ class OutputWriterPipeline:
             "links": data.get("links", []),
             "note": data.get("note"),
         }
+        if screenshot_rel:
+            metadata["screenshot"] = screenshot_rel
 
         # Reference downloaded files from FilesPipeline
         if data.get("files"):
@@ -86,8 +134,11 @@ class OutputWriterPipeline:
                 try:
                     d = dict(f)
                     p = d.get("path")
-                    if isinstance(p, str) and self.run_id:
-                        d["path"] = f"{self.run_id}/{p}"
+                    if isinstance(p, str):
+                        normalized = p.replace('\\', '/')
+                        if self.run_id:
+                            normalized = f"{self.run_id}/{normalized}"
+                        d["path"] = normalized
                     prefixed.append(d)
                 except Exception:
                     prefixed.append(f)
@@ -146,63 +197,70 @@ class TikaExtractPipeline:
             "application/vnd.ms-powerpoint": ".ppt",
             "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
             "text/calendar": ".ics",
+            "application/postscript": ".ps",
+            "application/vnd.ms-office": ".doc",
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
         }
         if mime in overrides:
             return overrides[mime]
         ext = mimetypes.guess_extension(mime)
         return ext
 
-    def _ext_from_tika_meta(self, meta: Dict[str, Any] | None) -> str | None:
+    def _mime_from_tika_meta(self, meta: Dict[str, Any] | None) -> str | None:
         if not isinstance(meta, dict):
             return None
-        # Normalize keys to lowercase
+        # Normalize keys to lowercase for flexible lookups
         lc = {str(k).lower(): v for k, v in meta.items()}
-        # Prefer filename hints from metadata
-        name_keys = [
-            "resourcename",  # some Tika outputs (case-insensitive)
-            "resource-name",
-            "x-tika:origresourcename",
-            "orig:resourcename",
-            "filename",
-            "file-name",
-            "meta:filename",
-            "file",
-            "name",
-            "content-disposition",
-            "dc:title",
-            "pdf:docinfo:title",
+        candidate_keys = [
+            "content-type",
+            "content_type",
+            "dc:format",
+            "meta:content-type",
         ]
-        for k in name_keys:
-            v = lc.get(k)
-            if isinstance(v, list) and v:
-                v = v[0]
-            if isinstance(v, str):
-                ext = Path(v).suffix
-                if ext:
-                    return ext
-        # Fall back to Content-Type derived extension
-        mime = lc.get("content-type") or lc.get("content_type") or lc.get("dc:format")
-        if isinstance(mime, list) and mime:
-            mime = mime[0]
-        if isinstance(mime, str):
-            return self._ext_from_mime(mime)
-        # As a last resort, scan all metadata values for something that looks like a filename.ext
+        for key in candidate_keys:
+            val = lc.get(key)
+            if isinstance(val, list) and val:
+                val = val[0]
+            if isinstance(val, str):
+                mime = val.split(";", 1)[0].strip()
+                if mime:
+                    return mime
+        return None
+
+    def _mime_from_magic(self, path: Path) -> str | None:
         try:
-            import re
-            pattern = re.compile(r"(?:^|[^A-Za-z0-9_\-.])([A-Za-z0-9_\-]+\.(pdf|docx?|xlsx?|pptx?|csv|json|xml|html?|txt|ics))(?=$|[^A-Za-z0-9_\-.])", re.IGNORECASE)
-            for val in meta.values():
-                if isinstance(val, list):
-                    vals = val
-                else:
-                    vals = [val]
-                for s in vals:
-                    if not isinstance(s, str):
-                        continue
-                    m = pattern.search(s)
-                    if m:
-                        return Path(m.group(1)).suffix
+            with path.open("rb") as f:
+                head = f.read(512)
         except Exception:
-            pass
+            return None
+        if not head:
+            return None
+        if head.startswith(b"%PDF-"):
+            return "application/pdf"
+        if head.startswith(b"%!PS"):
+            return "application/postscript"
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if head[0:3] == b"GIF" and head[3:6] in (b"87a", b"89a"):
+            return "image/gif"
+        if head.startswith(b"\xFF\xD8\xFF"):
+            return "image/jpeg"
+        if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or head.startswith(b"PK\x07\x08"):
+            return "application/zip"
+        if head.startswith(b"\xD0\xCF\x11\xE0"):
+            return "application/vnd.ms-office"
+        ascii_head = head.decode("ascii", errors="ignore").strip().lower()
+        if ascii_head.startswith("<?xml"):
+            return "application/xml"
+        if ascii_head.startswith("<!doctype html") or "<html" in ascii_head:
+            return "text/html"
+        if ascii_head.startswith("{") and "}" in ascii_head:
+            return "application/json"
+        if ascii_head.startswith("[") and "]" in ascii_head:
+            return "application/json"
         return None
 
     def process_item(self, item: Item | Dict[str, Any], spider):
@@ -230,10 +288,21 @@ class TikaExtractPipeline:
             # Try to rename file to have a proper extension if missing
             new_rel = rel
             try:
-                # Prefer resourceName-derived extension; then MIME-based
-                want_ext = self._ext_from_tika_meta(meta)
+                mime_hint = self._mime_from_tika_meta(meta)
+                if not mime_hint:
+                    content_type = data.get("content_type")
+                    if isinstance(content_type, str):
+                        mime_hint = content_type.split(";", 1)[0].strip() or None
+                if not mime_hint:
+                    mime_hint = self._mime_from_magic(abs_path)
+                want_ext = self._ext_from_mime(mime_hint) if mime_hint else None
                 suffix = Path(rel).suffix
-                if (not suffix) and want_ext:
+                normalized_suffix = suffix.lower() if suffix else ""
+                normalized_want = want_ext.lower() if want_ext else ""
+                needs_rename = False
+                if want_ext and (not suffix or normalized_suffix != normalized_want):
+                    needs_rename = True
+                if needs_rename:
                     target = Path(rel).with_suffix(want_ext)
                     target_abs = self.files_store / target
                     target_abs.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +312,7 @@ class TikaExtractPipeline:
                         f["path"] = new_rel
                         # Also update abs_path for any downstream use
                         abs_path = target_abs
-                        spider.logger.info(f"Renamed downloaded file to add extension: {rel} -> {new_rel}")
+                        spider.logger.info(f"Renamed downloaded file based on MIME {mime_hint}: {rel} -> {new_rel}")
                     except Exception as re:
                         spider.logger.warning(f"Could not rename {abs_path} to {target_abs}: {re}")
             except Exception as e:

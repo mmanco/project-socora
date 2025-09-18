@@ -15,6 +15,9 @@ TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
 ROBOTSTXT_OBEY = True
 
 # Concurrency defaults; tune as needed
+RETRY_ENABLED = os.getenv("SCRAPY_RETRY_ENABLED", "true").lower() != "false"
+RETRY_TIMES = int(os.getenv("SCRAPY_RETRY_TIMES", "4"))
+
 CONCURRENT_REQUESTS = int(os.getenv("SCRAPY_CONCURRENT_REQUESTS", 8))
 
 # AutoThrottle to be kind by default

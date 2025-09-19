@@ -4,12 +4,21 @@ import re
 import mimetypes
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any, Set
+from typing import Dict, Any, Set, List
 from scrapy import Item
 from .tika_client import extract_with_tika, TikaError
 
 MAX_SLUG_LEN = 80
 
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return repr(value)
 
 def _slugify(text: str, max_len: int = MAX_SLUG_LEN) -> str:
     slug = re.sub(r"[^A-Za-z0-9\-_.]+", "-", text)
@@ -65,9 +74,9 @@ class OutputWriterPipeline:
     def open_spider(self, spider):
         settings = spider.settings
         base = settings.get("OUTPUT_BASE_DIR") or os.getenv("SCRAPY_OUTPUT_DIR", os.path.join(os.getcwd(), "output"))
+        files_store = settings.get("FILES_STORE")
         run_id = settings.get("RUN_ID")
         if not run_id:
-            files_store = settings.get("FILES_STORE")
             if files_store:
                 try:
                     fs_path = Path(files_store)
@@ -88,6 +97,7 @@ class OutputWriterPipeline:
             pass
         self.run_dir = Path(base) / run_id
         self.run_id = run_id
+        self.files_store_root = Path(files_store).resolve() if files_store else None
         self._slug_counts: Dict[str, int] = {}
         self._used_slugs: Set[str] = set()
         # Expose on spider for other components (if needed)
@@ -96,10 +106,105 @@ class OutputWriterPipeline:
         except Exception:
             pass
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._write_run_config(spider, run_id, base, files_store)
         spider.logger.info(f"Writing outputs to: {self.run_dir}")
 
+    def _collect_run_config(self, spider, run_id: str, base_dir: str, files_store: str | None) -> Dict[str, Any]:
+        config: Dict[str, Any] = {
+            "run_id": run_id,
+            "spider": getattr(spider, "name", spider.__class__.__name__),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "output": {
+                "base_dir": str(base_dir),
+                "run_dir": str(self.run_dir),
+            },
+        }
+        if files_store:
+            config.setdefault("output", {})["files_store"] = str(files_store)
+        start_urls: List[str] = []
+        start_arg = getattr(spider, "_start_urls_arg", None)
+        if isinstance(start_arg, str):
+            start_urls.extend([u.strip() for u in start_arg.split(",") if u.strip()])
+        elif isinstance(start_arg, (list, tuple, set)):
+            start_urls.extend([str(u).strip() for u in start_arg if str(u).strip()])
+        start_attr = getattr(spider, "start_urls", None)
+        if isinstance(start_attr, (list, tuple, set)):
+            for u in start_attr:
+                s = str(u).strip()
+                if s:
+                    start_urls.append(s)
+        if start_urls:
+            dedup: List[str] = []
+            seen = set()
+            for url in start_urls:
+                if url not in seen:
+                    dedup.append(url)
+                    seen.add(url)
+            config["start_urls"] = dedup
+        url_file = getattr(spider, "_url_file", None)
+        if isinstance(url_file, str) and url_file.strip():
+            config["url_file"] = url_file.strip()
+        allowed_list: List[str] = []
+        for src in (getattr(spider, "_allowed", None), getattr(spider, "allowed_domains", None)):
+            if isinstance(src, (list, tuple, set)):
+                for val in src:
+                    s = str(val).strip()
+                    if s:
+                        allowed_list.append(s)
+        if allowed_list:
+            config["allowed_domains"] = sorted(dict.fromkeys(allowed_list))
+        spider_args: Dict[str, Any] = {}
+        follow = getattr(spider, "_follow", None)
+        if isinstance(follow, bool):
+            spider_args["follow_links"] = follow
+        max_depth = getattr(spider, "_max_depth", None)
+        if isinstance(max_depth, int):
+            spider_args["max_depth"] = max_depth
+        render_wait = getattr(spider, "_render_wait", None)
+        if isinstance(render_wait, str) and render_wait.strip():
+            spider_args["render_wait"] = render_wait.strip()
+        extractor_specs = getattr(spider, "_extractor_specs", None)
+        if extractor_specs:
+            spider_args["extractors"] = _json_safe(extractor_specs)
+        if spider_args:
+            config["spider_args"] = spider_args
+        settings_map: Dict[str, Any] = {}
+        try:
+            nav_timeout = spider.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT")
+            settings_map["playwright_default_navigation_timeout"] = nav_timeout
+        except Exception:
+            pass
+        if settings_map:
+            config["settings"] = settings_map
+        output_info = config.get("output")
+        if isinstance(output_info, dict):
+            config["output"] = {k: v for k, v in output_info.items() if v}
+        return {k: _json_safe(v) for k, v in config.items() if v not in (None, [], {}, set())}
+
+
+    def _write_run_config(self, spider, run_id: str, base_dir: str, files_store: str | None) -> None:
+        config = None
+        try:
+            config = self._collect_run_config(spider, run_id, base_dir, files_store)
+        except Exception as exc:
+            try:
+                spider.logger.debug(f"Failed to collect run config: {exc}")
+            except Exception:
+                pass
+        if not config:
+            return
+        cfg_path = self.run_dir / "run_config.json"
+        try:
+            with cfg_path.open("w", encoding="utf-8") as fh:
+                json.dump(config, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            try:
+                spider.logger.warning(f"Failed to write run_config.json: {exc}")
+            except Exception:
+                pass
     def process_item(self, item: Item | Dict[str, Any], spider):
         data: Dict[str, Any] = dict(item)
+        files_info = data.get("files") or []
         url = data.get("final_url") or data.get("url") or ""
         folder_name = self._make_unique_slug(url)
         target_dir = self.run_dir / folder_name
@@ -121,6 +226,60 @@ class OutputWriterPipeline:
         elif isinstance(data.get("text_nodes"), list):
             # Backward compatibility
             content_list = data.get("text_nodes")
+        image_meta_entries: List[Dict[str, str]] = []
+        seen_image_sources: Set[str] = set()
+        if content_list is not None:
+            url_to_path: Dict[str, str] = {}
+            for file_info in files_info:
+                if not isinstance(file_info, dict):
+                    continue
+                stored_path = (file_info.get("path") or "").strip()
+                if not stored_path:
+                    continue
+                normalized_path = stored_path.replace("\\", "/")
+                url_val = (file_info.get("url") or "").strip()
+                if url_val:
+                    url_to_path[url_val] = normalized_path
+                original_url = (file_info.get("original_url") or "").strip()
+                if original_url and original_url not in url_to_path:
+                    url_to_path[original_url] = normalized_path
+            for block in content_list:
+                if not isinstance(block, dict):
+                    continue
+                meta = block.get("meta")
+                if not isinstance(meta, dict) or not meta.get("isImage"):
+                    continue
+                src = (meta.get("src") or "").strip()
+                if not src:
+                    continue
+                stored_path = url_to_path.get(src)
+                rel_path_value = None
+                if stored_path:
+                    meta.setdefault("downloaded_path", stored_path)
+                    rel_candidate = stored_path
+                    if getattr(self, "files_store_root", None):
+                        try:
+                            abs_path = self.files_store_root / stored_path
+                            rel_candidate = os.path.relpath(abs_path, target_dir)
+                        except Exception:
+                            rel_candidate = stored_path
+                    rel_path_value = str(rel_candidate).replace("\\", "/")
+                    meta["downloaded_rel_path"] = rel_path_value
+                else:
+                    existing_rel = meta.get("downloaded_rel_path") or meta.get("downloaded_path")
+                    if existing_rel:
+                        rel_path_value = str(existing_rel).replace("\\", "/")
+                        meta["downloaded_rel_path"] = rel_path_value
+                if src not in seen_image_sources:
+                    entry: Dict[str, str] = {"src": src}
+                    link_path = rel_path_value or meta.get("downloaded_rel_path") or meta.get("downloaded_path")
+                    if link_path:
+                        entry["path"] = str(link_path).replace("\\", "/")
+                    alt_val = meta.get("alt")
+                    if isinstance(alt_val, str) and alt_val.strip():
+                        entry["alt"] = alt_val.strip()
+                    image_meta_entries.append(entry)
+                    seen_image_sources.add(src)
         if content_list is not None:
             content_doc = {
                 "source": data.get("final_url") or data.get("url"),
@@ -163,6 +322,8 @@ class OutputWriterPipeline:
         }
         if screenshot_rel:
             metadata["screenshot"] = screenshot_rel
+        if image_meta_entries:
+            metadata["images"] = image_meta_entries
         extra_meta = data.get("_metadata_extra")
         if isinstance(extra_meta, dict):
             for key, value in extra_meta.items():
@@ -172,10 +333,10 @@ class OutputWriterPipeline:
                     metadata[key] = value
 
         # Reference downloaded files from FilesPipeline
-        if data.get("files"):
+        if files_info:
             # Prefix run_id so paths are relative to output/files/<run_id>
             prefixed = []
-            for f in data["files"]:
+            for f in files_info:
                 try:
                     d = dict(f)
                     p = d.get("path")

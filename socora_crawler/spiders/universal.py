@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import mimetypes
 import re
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional, Tuple
 
 import asyncio
 import scrapy
@@ -22,6 +22,19 @@ FILE_EXTENSIONS = {
     ".mp3", ".wav", ".mp4", ".mov", ".avi",
     ".csv", ".json", ".xml", ".txt",
 }
+
+
+def _looks_like_css(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.startswith("@media") or "@font-face" in t:
+        return True
+    if ("{" in t and "}" in t) and re.search(r"[.#][A-Za-z]", t):
+        return True
+    if re.match(r"^\s*[#.][A-Za-z0-9_-]+\s*\{", t):
+        return True
+    return False
 
 
 def looks_like_file(url: str) -> bool:
@@ -115,15 +128,10 @@ class UniversalSpider(scrapy.Spider):
 
         html = response.text or ""
         title = self._extract_title(html)
-        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
-
         links = self._extract_links(response)
-
-        text_nodes = self._extract_text_nodes(response)
-        embeds = self._extract_iframes(response)
-
-        content_blocks = text_nodes + embeds
-
+        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
+        content_blocks = self._extract_content_blocks(response)
+        
         return self._build_page_results(
             response=response,
             depth=depth,
@@ -144,8 +152,7 @@ class UniversalSpider(scrapy.Spider):
             if html.strip():
                 title = self._extract_title(html)
                 links = self._extract_links(response)
-                text_nodes = self._extract_text_nodes(response)
-                embeds = self._extract_iframes(response)
+                content_blocks = self._extract_content_blocks(response)
                 self.logger.debug(f"Treating file-like response as HTML page: {response.url}")
                 normalized_content_type = content_type if "html" in (content_type or "").lower() else "text/html"
                 return self._build_page_results(
@@ -155,7 +162,7 @@ class UniversalSpider(scrapy.Spider):
                     content_type=normalized_content_type,
                     title=title,
                     links=links,
-                    content_blocks=text_nodes + embeds,
+                    content_blocks=content_blocks,
                     screenshot_bytes=None,
                 )
 
@@ -436,6 +443,28 @@ class UniversalSpider(scrapy.Spider):
         )
         self._run_extractors(response, item, context)
         content_list = list(context.content or [])
+        image_urls: List[str] = []
+        for block in content_list:
+            meta = block.get("meta") if isinstance(block, dict) else None
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("isImage"):
+                src = (meta.get("src") or "").strip()
+                if src.startswith(("http://", "https://")):
+                    image_urls.append(src)
+        if image_urls:
+            deduped_images: List[str] = []
+            seen_images = set()
+            for src in image_urls:
+                if src not in seen_images:
+                    deduped_images.append(src)
+                    seen_images.add(src)
+            file_urls = item.setdefault("file_urls", [])
+            seen_existing = set(file_urls)
+            for src in deduped_images:
+                if src not in seen_existing:
+                    file_urls.append(src)
+                    seen_existing.add(src)
         item["content"] = content_list
         links_list = list(dict.fromkeys(context.links))
         item["links"] = links_list
@@ -535,22 +564,8 @@ class UniversalSpider(scrapy.Spider):
 
         # Collect text nodes under body, ignoring those inside script/style/etc.
         text_nodes = body.xpath(
-            ".//text()[normalize-space() and not(ancestor::script or ancestor::style or ancestor::noscript or "
-            "ancestor::svg or ancestor::canvas or ancestor::template or ancestor::code or ancestor::pre)]"
+            ".//text()[normalize-space() and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::svg or ancestor::canvas or ancestor::template or ancestor::code or ancestor::pre)]"
         )
-
-        def looks_like_css(text: str) -> bool:
-            t = text.strip()
-            if not t:
-                return False
-            if t.startswith("@media") or "@font-face" in t:
-                return True
-            if ("{" in t and "}" in t) and re.search(r"[.#][A-Za-z]", t):
-                return True
-            if re.match(r"^\s*[#.][A-Za-z0-9_-]+\s*\{", t):
-                return True
-            return False
-
         out: List[dict] = []
         tree = doc.getroottree()
 
@@ -567,7 +582,7 @@ class UniversalSpider(scrapy.Spider):
                 s = re.sub(r"\s+", " ", str(node)).strip()
                 if not s:
                     continue
-                if looks_like_css(s):
+                if _looks_like_css(s):
                     continue
 
                 parent = node.getparent()
@@ -654,6 +669,72 @@ class UniversalSpider(scrapy.Spider):
             return False
 
     @staticmethod
+    def _xpath_sort_key(xpath: str) -> Tuple[Tuple[str, int], ...]:
+        if not xpath:
+            return tuple()
+        segments = []
+        for part in xpath.strip("/").split("/"):
+            if not part:
+                continue
+            name = part
+            index = 1
+            if "[" in part and part.endswith("]"):
+                name, idx_str = part[:-1].split("[", 1)
+                try:
+                    index = int(idx_str)
+                except ValueError:
+                    index = 1
+            if name == "text()":
+                name = "#text"
+            segments.append((name, index))
+        return tuple(segments)
+
+    @staticmethod
+    def _sort_content_blocks(blocks: List[dict]) -> List[dict]:
+        enumerated = list(enumerate(blocks))
+        enumerated.sort(key=lambda pair: (UniversalSpider._xpath_sort_key(pair[1].get("xpath") or ""), pair[0]))
+        return [block for _, block in enumerated]
+
+    @staticmethod
+    def _extract_images(response: Response) -> List[dict]:
+        out: List[dict] = []
+        try:
+            sels = response.xpath("//img[@src]")
+            for sel in sels:
+                try:
+                    src = sel.xpath("@src").get() or ""
+                    src = src.strip()
+                    if not src:
+                        continue
+                    if src.lower().startswith("data:"):
+                        continue
+                    href = response.urljoin(src)
+                    if not (href.startswith("http://") or href.startswith("https://")):
+                        continue
+                    alt = (sel.xpath("@alt").get() or "").strip()
+                    title = (sel.xpath("@title").get() or "").strip()
+                    try:
+                        el = sel.root
+                        xpath_str = el.getroottree().getpath(el)
+                    except Exception:
+                        xpath_str = "//img"
+                    meta = {"isImage": True, "src": href}
+                    if alt:
+                        meta["alt"] = alt
+                    if title:
+                        meta["title"] = title
+                    out.append({
+                        "xpath": xpath_str,
+                        "content": alt or href,
+                        "meta": meta,
+                    })
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
     def _extract_iframes(response: Response) -> List[dict]:
         out: List[dict] = []
         try:
@@ -690,6 +771,212 @@ class UniversalSpider(scrapy.Spider):
         return out
 
     @staticmethod
+    def _extract_content_blocks(response: Response) -> List[dict]:
+        """Extract text nodes, images, and embeds in document order using a single XPath union.
+        Ensures items appear in the same order as on the page.
+        """
+        out: List[dict] = []
+        html = response.text or ""
+        try:
+            doc = LH.fromstring(html)
+        except Exception:
+            return out
+
+        bodies = doc.xpath("//body")
+        if not bodies:
+            return out
+        body = bodies[0]
+
+        try:
+            # Include lazy-loading variants commonly used on the web
+            nodes = body.xpath(
+                """.//text()[normalize-space() and not(ancestor::script or ancestor::style or ancestor::noscript or ancestor::svg or ancestor::canvas or ancestor::template or ancestor::code or ancestor::pre)] | .//img[@src or @data-src or @data-original or @data-lazy or @data-lazy-src or @srcset or @data-srcset or @data-original-src or @data-thumb or @data-image or @data-url] | .//iframe[@src]"""
+            )
+        except Exception:
+            nodes = []
+
+        tree = doc.getroottree()
+
+        # use module-level _looks_like_css
+
+        def has_class(el, name: str) -> bool:
+            cls = el.get("class") or ""
+            return f" {name} " in f" {cls} "
+
+        def attr_lower(el, key: str) -> str:
+            v = el.get(key)
+            return v.lower() if isinstance(v, str) else ""
+
+        def _pick_best_from_srcset(srcset: str) -> str | None:
+            try:
+                items = []
+                for part in srcset.split(','):
+                    s = part.strip()
+                    if not s:
+                        continue
+                    bits = s.split()
+                    url = bits[0]
+                    score = 0
+                    if len(bits) >= 2:
+                        desc = bits[1]
+                        if desc.endswith('w'):
+                            try:
+                                score = int(desc[:-1])
+                            except Exception:
+                                score = 0
+                        elif desc.endswith('x'):
+                            try:
+                                score = int(float(desc[:-1]) * 1000)
+                            except Exception:
+                                score = 0
+                    items.append((score, url))
+                if not items:
+                    return None
+                items.sort()
+                return items[-1][1]
+            except Exception:
+                return None
+
+        def _image_abs_url_from_el(el) -> str | None:
+            try:
+                # Priority: src, data-src, data-original, data-lazy(-src), srcset variants
+                cand = (el.get('src') or '').strip()
+                if not cand:
+                    for attr in ('data-src', 'data-original', 'data-lazy', 'data-lazy-src', 'data-original-src', 'data-thumb', 'data-image', 'data-url'):
+                        val = el.get(attr)
+                        if isinstance(val, str) and val.strip():
+                            cand = val.strip()
+                            break
+                if not cand:
+                    # srcset attributes
+                    for sattr in ('srcset', 'data-srcset'):
+                        sval = el.get(sattr)
+                        if isinstance(sval, str) and sval.strip():
+                            pick = _pick_best_from_srcset(sval)
+                            if pick:
+                                cand = pick
+                                break
+                if not cand:
+                    return None
+                if cand.lower().startswith('data:'):
+                    return None
+                return response.urljoin(cand)
+            except Exception:
+                return None
+
+        for node in nodes:
+            try:
+                # Element nodes (img/iframe)
+                if hasattr(node, 'tag'):
+                    tag = (node.tag or '').lower()
+                    # Compute element xpath
+                    try:
+                        xpath_str = node.getroottree().getpath(node)
+                    except Exception:
+                        xpath_str = f"//{tag or 'node'}"
+                    if tag == 'img':
+                        href = _image_abs_url_from_el(node)
+                        if not (href.startswith('http://') or href.startswith('https://')):
+                            continue
+                        alt = (node.get('alt') or '').strip()
+                        title = (node.get('title') or '').strip()
+                        meta = {"isImage": True, "src": href}
+                        if alt:
+                            meta["alt"] = alt
+                        if title:
+                            meta["title"] = title
+                        out.append({
+                            "xpath": xpath_str,
+                            "content": alt or href,
+                            "meta": meta,
+                        })
+                        continue
+                    if tag == 'iframe':
+                        src = (node.get('src') or '').strip()
+                        if not src:
+                            continue
+                        href = response.urljoin(src)
+                        platform = UniversalSpider._detect_embed_platform(href)
+                        out.append({
+                            "xpath": xpath_str,
+                            "content": href,
+                            "meta": {"isEmbed": True, "href": href, "platform": platform},
+                        })
+                        continue
+
+                # Text node
+                s = str(node)
+                s = re.sub(r"\s+", " ", s).strip()
+                if not s or _looks_like_css(s):
+                    continue
+                parent = node.getparent()
+                if parent is None:
+                    continue
+                parent_path = tree.getpath(parent)
+                siblings = parent.xpath("text()")
+                pos = 1
+                for i, tnode in enumerate(siblings, start=1):
+                    if tnode is node:
+                        pos = i
+                        break
+                xpath_str = f"{parent_path}/text()[{pos}]"
+
+                # Ancestor-based flags
+                def has_ancestor(pred) -> bool:
+                    el = parent
+                    while el is not None:
+                        try:
+                            if pred(el):
+                                return True
+                        except Exception:
+                            pass
+                        el = el.getparent()
+                    return False
+
+                is_nav = has_ancestor(lambda el: el.tag.lower() == "nav" or attr_lower(el, "role") == "navigation" or el.tag.lower() == "a")
+                is_title = has_ancestor(lambda el: el.tag.lower() in {"h1","h2","h3","h4","h5","h6"} or attr_lower(el, "role") == "heading")
+                is_par = has_ancestor(lambda el: el.tag.lower() in {"p","li"})
+                if is_nav:
+                    is_par = False
+                is_action = has_ancestor(
+                    lambda el: el.tag.lower() == "button" or attr_lower(el, "role") == "button" or (
+                        el.tag.lower() == "input" and attr_lower(el, "type") in {"button","submit","reset"}
+                    ) or has_class(el, "btn")
+                )
+
+                meta = {
+                    "isNav": is_nav,
+                    "isTitle": is_title,
+                    "isParagraph": is_par,
+                    "isAction": is_action,
+                }
+                if is_nav:
+                    try:
+                        el = parent
+                        href_val = None
+                        while el is not None and href_val is None:
+                            if el.tag.lower() == "a":
+                                href_val = el.get("href")
+                                break
+                            el = el.getparent()
+                        if href_val:
+                            href_str = str(href_val).strip()
+                            low = href_str.lower()
+                            if not (low.startswith("javascript:") or low.startswith("mailto:") or low.startswith("tel:") or low.startswith("sms:") or low.startswith("callto:") or href_str.startswith("#")):
+                                meta["href"] = response.urljoin(href_str)
+                    except Exception:
+                        pass
+
+                out.append({
+                    "xpath": xpath_str,
+                    "content": s,
+                    "meta": meta,
+                })
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
     def _detect_embed_platform(href: str) -> str:
         try:
             host = urlparse(href).netloc.lower()
@@ -706,6 +993,8 @@ class UniversalSpider(scrapy.Spider):
         if "twitter.com" in host or host.endswith(".x.com") or host == "x.com":
             return "x"
         return "other"
+
+
 
 
 

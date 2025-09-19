@@ -429,18 +429,24 @@ name = "project-socora"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "playwright" },
+    { name = "pyopenssl" },
     { name = "scrapy" },
     { name = "scrapy-playwright" },
+    { name = "service-identity" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=43.0.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "playwright", specifier = ">=1.55.0" },
+    { name = "pyopenssl", specifier = ">=24.2.1" },
     { name = "scrapy", specifier = ">=2.13.3" },
     { name = "scrapy-playwright", specifier = ">=0.0.44" },
+    { name = "service-identity", specifier = ">=24.1.0" },
 ]
 
 [[package]]

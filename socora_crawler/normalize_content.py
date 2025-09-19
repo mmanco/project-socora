@@ -160,50 +160,51 @@ def _enumerate_text_content_files(run_root: Path) -> List[Path]:
     return sorted(run_root.rglob("content.json"))
 
 
-def _infer_crawler_depth(run_root: Path) -> Optional[int]:
-    env_vars = [
-        "NORM_CRAWLER_DEPTH",
-        "CRAWLER_DEPTH",
-        "CRAWLER_MAX_DEPTH",
-        "MAX_DEPTH",
-    ]
-    for var in env_vars:
-        val = os.getenv(var)
-        if not val:
-            continue
-        try:
-            depth = int(val)
-        except (TypeError, ValueError):
-            continue
-        if depth >= 0:
-            return depth
+def _load_run_config(run_root: Path) -> Optional[Dict]:
     repo_root = _find_repo_root(run_root)
-    candidate_files = [
-        repo_root / ".output" / run_root.name / "normalize_config.json",
-        repo_root / ".output" / run_root.name / "run_config.json",
-        run_root / "normalize_config.json",
+    candidates = [
         run_root / "run_config.json",
-        run_root / "crawl_config.json",
-        run_root / "run_meta.json",
+        repo_root / "output" / run_root.name / "run_config.json",
     ]
-    keys = ("crawler_depth", "max_depth", "depth", "maxDepth", "crawl_depth", "crawlerDepth")
-    for cfg_path in candidate_files:
+    seen = set()
+    for cfg_path in candidates:
+        try:
+            resolved = cfg_path.resolve()
+        except Exception:
+            resolved = cfg_path
+        if resolved in seen:
+            continue
+        seen.add(resolved)
         try:
             if not cfg_path.exists():
                 continue
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            with cfg_path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
         except Exception:
             continue
-        if isinstance(data, dict):
-            for key in keys:
-                if key in data:
-                    val = data.get(key)
-                    try:
-                        depth = int(val)
-                    except (TypeError, ValueError):
-                        continue
-                    if depth >= 0:
-                        return depth
+    return None
+
+
+def _run_config_depth(config: Optional[Dict]) -> Optional[int]:
+    if not isinstance(config, dict):
+        return None
+    mappings: List[Dict] = []
+    mappings.append(config)
+    for key in ("spider_args", "settings", "crawler", "meta", "spider"):
+        sub = config.get(key) if isinstance(config, dict) else None
+        if isinstance(sub, dict):
+            mappings.append(sub)
+    for mapping in mappings:
+        for depth_key in ("max_depth", "depth", "crawler_depth", "maxDepth"):
+            if depth_key in mapping:
+                try:
+                    depth = int(mapping[depth_key])
+                except (TypeError, ValueError):
+                    continue
+                if depth >= 0:
+                    return depth
     return None
 
 
@@ -218,7 +219,7 @@ def _prune_commonalities_by_depth(commons: Dict, depth: Optional[int]) -> Dict:
         return commons
     if threshold < 0:
         return commons
-    for key in ("text_page_freq", "nav_text_page_freq", "action_text_page_freq"):
+    for key in ("text_page_freq", "nav_text_page_freq", "action_text_page_freq", "image_page_freq"):
         freq_map = commons.get(key)
         if isinstance(freq_map, dict):
             commons[key] = {k: v for k, v in freq_map.items() if _safe_int(v) > threshold}
@@ -233,12 +234,13 @@ def _safe_int(value) -> int:
         return 0
 
 
-def _compute_commonalities(run_root: Path) -> Dict:
+def _compute_commonalities(run_root: Path, run_config: Optional[Dict]) -> Dict:
     files = _enumerate_text_content_files(run_root)
     pages_count = 0
     text_to_pages: Dict[str, Set[str]] = {}
     nav_text_to_pages: Dict[str, Set[str]] = {}
     action_text_to_pages: Dict[str, Set[str]] = {}
+    image_to_pages: Dict[str, Set[str]] = {}
 
     for f in files:
         try:
@@ -254,6 +256,7 @@ def _compute_commonalities(run_root: Path) -> Dict:
         seen_texts_page: Set[str] = set()
         seen_texts_nav_page: Set[str] = set()
         seen_texts_action_page: Set[str] = set()
+        seen_images_page: Set[str] = set()
         for it in items:
             text = (it.get("content") or "").strip()
             if not text:
@@ -264,12 +267,18 @@ def _compute_commonalities(run_root: Path) -> Dict:
                 seen_texts_nav_page.add(text)
             if meta.get("isAction"):
                 seen_texts_action_page.add(text)
+            if meta.get("isImage"):
+                src = (meta.get("src") or "").strip()
+                if src:
+                    seen_images_page.add(src)
         for t in seen_texts_page:
             text_to_pages.setdefault(t, set()).add(page_id)
         for t in seen_texts_nav_page:
             nav_text_to_pages.setdefault(t, set()).add(page_id)
         for t in seen_texts_action_page:
             action_text_to_pages.setdefault(t, set()).add(page_id)
+        for src in seen_images_page:
+            image_to_pages.setdefault(src, set()).add(page_id)
 
     commons = {
         "run_id": run_root.name,
@@ -277,9 +286,12 @@ def _compute_commonalities(run_root: Path) -> Dict:
         "text_page_freq": {k: len(v) for k, v in text_to_pages.items()},
         "nav_text_page_freq": {k: len(v) for k, v in nav_text_to_pages.items()},
         "action_text_page_freq": {k: len(v) for k, v in action_text_to_pages.items()},
+        "image_page_freq": {k: len(v) for k, v in image_to_pages.items()},
     }
-    depth = _infer_crawler_depth(run_root)
+    depth = _run_config_depth(run_config)
     commons = _prune_commonalities_by_depth(commons, depth if depth is not None else commons.get("crawler_depth"))
+    if depth is not None:
+        commons["crawler_depth"] = depth
     return commons
 
 
@@ -288,6 +300,8 @@ def _load_or_build_commonalities(input_path: Path, force: bool = False) -> Optio
     if not run_root:
         return None
     repo_root = _find_repo_root(run_root)
+    run_config = _load_run_config(run_root)
+    depth_from_config = _run_config_depth(run_config)
     cache_dir = repo_root / "output" / run_root.name
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / "text_commonalities.json"
@@ -297,8 +311,7 @@ def _load_or_build_commonalities(input_path: Path, force: bool = False) -> Optio
                 cached = json.load(fh)
             if not isinstance(cached, dict):
                 return cached
-            inferred_depth = _infer_crawler_depth(run_root)
-            depth_to_use = inferred_depth if inferred_depth is not None else cached.get("crawler_depth")
+            depth_to_use = depth_from_config if depth_from_config is not None else cached.get("crawler_depth")
             cached = _prune_commonalities_by_depth(cached, depth_to_use)
             if depth_to_use is not None:
                 try:
@@ -309,7 +322,7 @@ def _load_or_build_commonalities(input_path: Path, force: bool = False) -> Optio
             return cached
         except Exception:
             pass
-    commons = _compute_commonalities(run_root)
+    commons = _compute_commonalities(run_root, run_config)
     try:
         with cache_file.open("w", encoding="utf-8") as fh:
             json.dump(commons, fh, ensure_ascii=False, indent=2)
@@ -397,6 +410,8 @@ def normalize_page_content(
             continue
         table_key, row, col, is_header = info
         meta = it.get("meta") or {}
+        if bool(meta.get("isImage")):
+            continue
         # Hard exclusion for action items even inside tables
         if bool(meta.get("isAction")):
             continue
@@ -519,6 +534,27 @@ def normalize_page_content(
 
         text = it.get("content") or ""
         meta = it.get("meta") or {}
+
+        if meta.get("isImage"):
+            src = (meta.get("src") or "").strip()
+            link_target = meta.get("downloaded_rel_path") or meta.get("downloaded_path") or src
+            if not link_target:
+                continue
+            link_target = str(link_target).replace("\\", "/")
+            raw_alt = meta.get("alt")
+            alt_candidate = raw_alt if isinstance(raw_alt, str) else ""
+            alt_text = (alt_candidate or str(text)).strip()
+            if not alt_text:
+                try:
+                    parsed = urlparse(src or link_target)
+                    alt_text = Path(parsed.path).name
+                except Exception:
+                    alt_text = ""
+            alt_text = (alt_text or "Image").strip() or "Image"
+            alt_text = alt_text.replace("[", "\\[").replace("]", "\\]")
+            lines.append(f"![{alt_text}]({link_target})")
+            first_line = False
+            continue
 
         ok, t = include_item(text, meta)
         if not ok:

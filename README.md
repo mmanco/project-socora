@@ -138,14 +138,14 @@ Convert a page’s `content.json` into clean Markdown using the built‑in norma
 Single file:
 
 ```
-uv run python -m socora_crawler.normalize_text_content output/run-YYYYmmdd-HHMMSS/<page>/content.json > output/run-YYYYmmdd-HHMMSS/<page>/content.md
+uv run python -m socora_crawler.normalize_content output/run-YYYYmmdd-HHMMSS/<page>/content.json > output/run-YYYYmmdd-HHMMSS/<page>/content.md
 ```
 
 All pages (bash):
 
 ```
 find output -type f -name content.json -print0 | while IFS= read -r -d '' f; do \
-  uv run python -m socora_crawler.normalize_text_content "$f" > "$(dirname "$f")/content.md"; \
+  uv run python -m socora_crawler.normalize_content "$f" > "$(dirname "$f")/content.md"; \
 done
 ```
 
@@ -153,7 +153,7 @@ All pages (PowerShell):
 
 ```
 Get-ChildItem -Recurse -Filter content.json output | ForEach-Object { \
-  uv run python -m socora_crawler.normalize_text_content $_.FullName | Out-File -FilePath (Join-Path $_.DirectoryName 'content.md') -Encoding utf8 \
+  uv run python -m socora_crawler.normalize_content $_.FullName | Out-File -FilePath (Join-Path $_.DirectoryName 'content.md') -Encoding utf8 \
 }
 ```
 
@@ -180,7 +180,7 @@ End-to-end sequence for a typical run:
 
 2) Normalize page text to Markdown
 
-- Single page: `uv run python -m socora_crawler.normalize_text_content output/run-.../<page>/content.json > output/run-.../<page>/content.md`
+- Single page: `uv run python -m socora_crawler.normalize_content output/run-.../<page>/content.json > output/run-.../<page>/content.md`
 - Batch (latest run):
   - Bash: `scripts/normalize_run.sh`
   - Windows: `scripts\normalize_run.bat`

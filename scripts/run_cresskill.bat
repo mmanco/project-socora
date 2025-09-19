@@ -36,7 +36,10 @@ REM Run Scrapy Universal spider via uv on Windows
 uv run scrapy crawl universal ^
   -a start_urls="%START_URLS%" ^
   -a allowed="%ALLOWED%" ^
-  -a follow_links=true -a max_depth=%MAX_DEPTH% ^
+  -a follow_links=true ^
+  -a max_depth=%MAX_DEPTH% ^
+  -a extractors="extractors.cresskill.meeting_documents" 
+  -a max_depth=%MAX_DEPTH% ^
   -s ROBOTSTXT_OBEY=true ^
   -s SCRAPY_OUTPUT_DIR=./output
 

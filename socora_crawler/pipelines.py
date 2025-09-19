@@ -1,21 +1,37 @@
 import json
 import os
 import re
+import mimetypes
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
-
+from typing import Dict, Any, Set
 from scrapy import Item
-
 from .tika_client import extract_with_tika, TikaError
-import mimetypes
 
-def _slugify(text: str, max_len: int = 80) -> str:
-    text = re.sub(r"[^A-Za-z0-9\-_.]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-_")
-    if len(text) > max_len:
-        text = text[:max_len].rstrip("-_")
-    return text or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+MAX_SLUG_LEN = 80
+
+
+def _slugify(text: str, max_len: int = MAX_SLUG_LEN) -> str:
+    slug = re.sub(r"[^A-Za-z0-9\-_.]+", "-", text)
+    slug = re.sub(r"-+", "-", slug).strip("-_")
+    if max_len and len(slug) > max_len:
+        slug = slug[:max_len].rstrip("-_")
+    return slug or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _slug_with_suffix(base_slug: str, index: int, max_len: int = MAX_SLUG_LEN) -> str:
+    suffix = f"-{index}"
+    if max_len <= len(suffix):
+        digits = str(index)
+        return digits if max_len <= 0 else digits[-max_len:]
+    available = max_len - len(suffix)
+    trimmed = base_slug[:available].rstrip("-_")
+    if not trimmed:
+        trimmed = base_slug[:available]
+    if not trimmed:
+        trimmed = "0"
+    return f"{trimmed}{suffix}"
+
 
 
 class OutputWriterPipeline:
@@ -23,8 +39,28 @@ class OutputWriterPipeline:
     Writes, for each item, a directory containing:
     - metadata.json: basic metadata including file references if any
     - content.html (for HTML pages) or content.txt (for plain text)
+    - screenshot.png (if screenshot bytes present in item)
     Files downloaded by FilesPipeline are referenced via the 'files' field.
     """
+
+    def _make_unique_slug(self, text: str, max_len: int = MAX_SLUG_LEN) -> str:
+        if not hasattr(self, '_slug_counts'):
+            self._slug_counts = {}
+        if not hasattr(self, '_used_slugs'):
+            self._used_slugs = set()
+        base_slug = _slugify(text, max_len=max_len)
+        count = self._slug_counts.get(base_slug, 0)
+        slug = base_slug
+        run_dir = getattr(self, "run_dir", None)
+        if slug in self._used_slugs or (run_dir and (run_dir / slug).exists()):
+            while True:
+                count += 1
+                slug = _slug_with_suffix(base_slug, count, max_len=max_len)
+                if slug not in self._used_slugs and not (run_dir and (run_dir / slug).exists()):
+                    break
+        self._slug_counts[base_slug] = count
+        self._used_slugs.add(slug)
+        return slug
 
     def open_spider(self, spider):
         settings = spider.settings
@@ -52,6 +88,8 @@ class OutputWriterPipeline:
             pass
         self.run_dir = Path(base) / run_id
         self.run_id = run_id
+        self._slug_counts: Dict[str, int] = {}
+        self._used_slugs: Set[str] = set()
         # Expose on spider for other components (if needed)
         try:
             setattr(spider, "run_id", run_id)
@@ -63,7 +101,7 @@ class OutputWriterPipeline:
     def process_item(self, item: Item | Dict[str, Any], spider):
         data: Dict[str, Any] = dict(item)
         url = data.get("final_url") or data.get("url") or ""
-        folder_name = _slugify(url)[:80] or _slugify(spider.name)
+        folder_name = self._make_unique_slug(url)
         target_dir = self.run_dir / folder_name
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,6 +163,13 @@ class OutputWriterPipeline:
         }
         if screenshot_rel:
             metadata["screenshot"] = screenshot_rel
+        extra_meta = data.get("_metadata_extra")
+        if isinstance(extra_meta, dict):
+            for key, value in extra_meta.items():
+                if isinstance(value, list) and isinstance(metadata.get(key), list):
+                    metadata[key] = list(dict.fromkeys(metadata[key] + value))
+                else:
+                    metadata[key] = value
 
         # Reference downloaded files from FilesPipeline
         if data.get("files"):
@@ -333,3 +378,4 @@ class TikaExtractPipeline:
                     item["text"] = first_text
 
         return item
+

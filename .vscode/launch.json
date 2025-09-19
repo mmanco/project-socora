@@ -1,4 +1,4 @@
-﻿{
+{
   "version": "0.2.0",
   "configurations": [
     {
@@ -17,6 +17,7 @@
         "-a", "allowed=${input:allowedDomains}",
         "-a", "follow_links=true",
         "-a", "max_depth=${input:maxDepth}",
+        "-a", "extractors=${input:extractors}",
         "-s", "ROBOTSTXT_OBEY=true",
         "-s", "SCRAPY_OUTPUT_DIR=./output"
       ]
@@ -40,6 +41,12 @@
       "type": "promptString",
       "description": "Maximum crawl depth",
       "default": "8"
+    },
+    {
+      "id": "extractors",
+      "type": "promptString",
+      "description": "Extractors (comma-separated)",
+      "default": "extractors.cresskill.meeting_documents"
     }
   ]
 }

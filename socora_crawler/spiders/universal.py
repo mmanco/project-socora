@@ -3,10 +3,12 @@ from __future__ import annotations
 import mimetypes
 import re
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
 import asyncio
 import scrapy
+
+from socora_crawler.extractors.framework import ExtractorContext, build_extractors
 from scrapy.http import Response, Request
 from urllib.parse import urlparse, parse_qs
 from twisted.python.failure import Failure
@@ -70,6 +72,7 @@ class UniversalSpider(scrapy.Spider):
         follow_links: str = "true",
         max_depth: int = 2,
         render_wait: str = "networkidle",
+        extractors: Optional[str] = None,
         *args,
         **kwargs,
     ):
@@ -80,16 +83,240 @@ class UniversalSpider(scrapy.Spider):
         self._follow = follow_links.lower() != "false"
         self._max_depth = int(max_depth)
         self._render_wait = render_wait
+        self._extractor_specs: List[Any] = self._parse_extractor_specs(extractors)
+        self._extractors: List[Any] = []
         self._max_playwright_retries = 4
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
         spider = super().from_crawler(crawler, *args, **kwargs)
         spider._apply_settings(crawler.settings)
+        spider._init_extractors(crawler)
+
         return spider
+
+    async def start(self) -> AsyncIterator[Request]:
+        for req in self._iter_start_requests():
+            yield req
+
+    async def parse_page(self, response: Response, depth: int):
+        page = response.meta.get("playwright_page")
+        screenshot_bytes = None
+        if page is not None:
+            try:
+                screenshot_bytes = await page.screenshot(full_page=True, type="png")
+            except Exception as exc:
+                self.logger.warning(f"Screenshot capture failed for {response.url}: {exc}")
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        html = response.text or ""
+        title = self._extract_title(html)
+        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
+
+        links = self._extract_links(response)
+
+        text_nodes = self._extract_text_nodes(response)
+        embeds = self._extract_iframes(response)
+
+        content_blocks = text_nodes + embeds
+
+        return self._build_page_results(
+            response=response,
+            depth=depth,
+            html=html,
+            content_type=content_type or "text/html",
+            title=title,
+            links=links,
+            content_blocks=content_blocks,
+            screenshot_bytes=screenshot_bytes,
+        )
+
+    def parse_file(self, response: Response, depth: int) -> Any:
+        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
+        status = response.status
+
+        if self._should_treat_response_as_html(content_type, response.body):
+            html = response.text or ""
+            if html.strip():
+                title = self._extract_title(html)
+                links = self._extract_links(response)
+                text_nodes = self._extract_text_nodes(response)
+                embeds = self._extract_iframes(response)
+                self.logger.debug(f"Treating file-like response as HTML page: {response.url}")
+                normalized_content_type = content_type if "html" in (content_type or "").lower() else "text/html"
+                return self._build_page_results(
+                    response=response,
+                    depth=depth,
+                    html=html,
+                    content_type=normalized_content_type,
+                    title=title,
+                    links=links,
+                    content_blocks=text_nodes + embeds,
+                    screenshot_bytes=None,
+                )
+
+        item = {
+            "url": response.request.url,
+            "final_url": response.url,
+            "status": status,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "content_type": content_type,
+            "file_urls": [response.url],
+            "note": "Direct file URL"
+        }
+        return item
+    
+    def on_request_error(self, failure: Failure):
+        request = failure.request
+        url = getattr(request, 'url', None) or (request and request.url)
+        depth = 0
+        try:
+            depth = int((request.cb_kwargs or {}).get('depth', 0))
+        except Exception:
+            pass
+
+        page = request.meta.pop("playwright_page", None) if request.meta else None
+        if page is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                try:
+                    loop = asyncio.get_event_loop()
+                except Exception:
+                    loop = None
+            if loop is not None:
+                try:
+                    loop.create_task(page.close())
+                except Exception:
+                    pass
+
+        msg = str(failure.value)
+        # If Playwright navigation triggers a download, retry as a direct file request
+        if 'Download is starting' in msg or 'download is starting' in msg:
+            self.logger.info(f"Retrying as file due to download start: {url}")
+            return scrapy.Request(url, callback=self.parse_file, cb_kwargs={'depth': depth}, dont_filter=True)
+
+        if request.meta and request.meta.get('playwright'):
+            retry_times = int(request.meta.get('playwright_retry_times', 0))
+            max_retries = int(request.meta.get('playwright_max_retries', self._max_playwright_retries))
+            if retry_times < max_retries:
+                new_meta = dict(request.meta)
+                new_meta.pop('playwright_page', None)
+                new_meta['playwright_retry_times'] = retry_times + 1
+                new_meta.setdefault('playwright_max_retries', max_retries)
+                self.logger.warning(
+                    f"Playwright request failed (attempt {retry_times + 1}/{max_retries}) for {url}: {msg}. Retrying..."
+                )
+                return request.replace(meta=new_meta, dont_filter=True)
+            else:
+                self.logger.error(
+                    f"Playwright request exhausted {retry_times} retries for {url}. Last error: {msg}"
+                )
+        else:
+            self.logger.warning(f"Playwright request failed: {msg} for {url}")    
 
     def _apply_settings(self, settings):
         self._max_playwright_retries = int(settings.getint("RETRY_TIMES", 4))
+        self._extractor_specs.extend(self._parse_extractor_specs(settings.get("EXTRACTORS")))
+        self._extractor_specs.extend(self._parse_extractor_specs(settings.get("SUPPLEMENTAL_EXTRACTORS")))
+
+    def _ensure_extractor_modules(self, specs: List[Any]) -> List[Any]:
+        out: List[Any] = []
+        for entry in specs:
+            if isinstance(entry, str) and ':' not in entry and '.' in entry:
+                try:
+                    import importlib
+                    importlib.import_module(entry)
+                except Exception as exc:
+                    self.logger.warning("Could not import extractor module %s: %s", entry, exc)
+                    out.append(entry)
+                    continue
+            out.append(entry)
+        return out
+    def _parse_extractor_specs(self, value) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [s.strip() for s in value.split(',') if s.strip()]
+        if isinstance(value, dict):
+            return [value]
+        if isinstance(value, (list, tuple, set)):
+            specs: List[Any] = []
+            for entry in value:
+                specs.extend(self._parse_extractor_specs(entry))
+            return specs
+        return [value]
+
+    def _init_extractors(self, crawler):
+        specs = self._extractor_specs or []
+        if specs:
+            specs = self._ensure_extractor_modules(specs)
+            unique: List[Any] = []
+            for entry in specs:
+                if entry not in unique:
+                    unique.append(entry)
+            specs = unique
+        if not specs:
+            self._extractors = []
+            return
+        instances = build_extractors(specs)
+        bound: List[Any] = []
+        for extractor in instances:
+            try:
+                extractor.bind(self)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to bind extractor %s: %s",
+                    getattr(extractor, 'name', extractor.__class__.__name__),
+                    exc,
+                )
+                continue
+            bound.append(extractor)
+        self._extractors = bound
+        if bound:
+            names = ", ".join(getattr(e, 'name', e.__class__.__name__) for e in bound)
+            self.logger.info("Loaded extractors: %s", names)
+
+    def _run_extractors(
+        self,
+        response: Response,
+        item: Dict[str, Any],
+        context: ExtractorContext,
+    ) -> None:
+        if not self._extractors:
+            return
+
+        for extractor in self._extractors:
+            name = getattr(extractor, 'name', extractor.__class__.__name__)
+            try:
+                if extractor.matches(response, item, context):
+                    extractor.apply(response, item, context)
+            except Exception as exc:
+                self.logger.warning("Extractor %s failed for %s: %s", name, response.url, exc)
+        if getattr(context, "item_updates", None):
+            try:
+                item.update(context.item_updates)
+            except Exception:
+                pass
+        if context.metadata:
+            extra = item.setdefault("_metadata_extra", {})
+            if not isinstance(extra, dict):
+                extra = {}
+                item["_metadata_extra"] = extra
+            for key, value in context.metadata.items():
+                if isinstance(value, list):
+                    existing = extra.get(key)
+                    if isinstance(existing, list):
+                        combined = list(dict.fromkeys(existing + value))
+                    else:
+                        combined = list(dict.fromkeys(value))
+                    extra[key] = combined
+                else:
+                    extra[key] = value
 
     def _iter_start_requests(self) -> Iterable[Request]:
         urls: List[str] = []
@@ -151,48 +378,6 @@ class UniversalSpider(scrapy.Spider):
                     dont_filter=True,
                 )
 
-    def start_requests(self) -> Iterable[Request]:
-        yield from self._iter_start_requests()
-
-    async def start(self) -> AsyncIterator[Request]:
-        for req in self._iter_start_requests():
-            yield req
-
-    def parse_file(self, response: Response, depth: int) -> Any:
-        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
-        status = response.status
-
-        if self._should_treat_response_as_html(content_type, response.body):
-            html = response.text or ""
-            if html.strip():
-                title = self._extract_title(html)
-                links = self._extract_links(response)
-                text_nodes = self._extract_text_nodes(response)
-                embeds = self._extract_iframes(response)
-                self.logger.debug(f"Treating file-like response as HTML page: {response.url}")
-                normalized_content_type = content_type if "html" in (content_type or "").lower() else "text/html"
-                return self._build_page_results(
-                    response=response,
-                    depth=depth,
-                    html=html,
-                    content_type=normalized_content_type,
-                    title=title,
-                    links=links,
-                    content_blocks=text_nodes + embeds,
-                    screenshot_bytes=None,
-                )
-
-        item = {
-            "url": response.request.url,
-            "final_url": response.url,
-            "status": status,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "content_type": content_type,
-            "file_urls": [response.url],
-            "note": "Direct file URL"
-        }
-        return item
-
     def _should_treat_response_as_html(self, content_type: str, body: bytes) -> bool:
         ctype = (content_type or "").lower()
         if "text/html" in ctype or "application/xhtml" in ctype:
@@ -215,43 +400,7 @@ class UniversalSpider(scrapy.Spider):
             return True
         if lowered.startswith(b"<head") or lowered.startswith(b"<body"):
             return True
-        return False
-
-    async def parse_page(self, response: Response, depth: int):
-        page = response.meta.get("playwright_page")
-        screenshot_bytes = None
-        if page is not None:
-            try:
-                screenshot_bytes = await page.screenshot(full_page=True, type="png")
-            except Exception as exc:
-                self.logger.warning(f"Screenshot capture failed for {response.url}: {exc}")
-            finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-
-        html = response.text or ""
-        title = self._extract_title(html)
-        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
-
-        links = self._extract_links(response)
-
-        text_nodes = self._extract_text_nodes(response)
-        embeds = self._extract_iframes(response)
-
-        content_blocks = text_nodes + embeds
-
-        return self._build_page_results(
-            response=response,
-            depth=depth,
-            html=html,
-            content_type=content_type or "text/html",
-            title=title,
-            links=links,
-            content_blocks=content_blocks,
-            screenshot_bytes=screenshot_bytes,
-        )
+        return False 
 
     def _build_page_results(
         self,
@@ -265,6 +414,8 @@ class UniversalSpider(scrapy.Spider):
         screenshot_bytes: Optional[bytes] = None,
     ) -> List[Any]:
         results: List[Any] = []
+        links_list = list(links or [])
+        content_list = list(content_blocks or [])
         item = {
             "url": response.request.url,
             "final_url": response.url,
@@ -273,9 +424,21 @@ class UniversalSpider(scrapy.Spider):
             "content_type": content_type or "text/html",
             "title": title,
             "html": html,
-            "links": links,
-            "content": content_blocks,
+            "links": links_list,
         }
+        context = ExtractorContext(
+            content=content_list,
+            links=links_list,
+            item=item,
+            metadata={},
+            requests=[],
+            item_updates={},
+        )
+        self._run_extractors(response, item, context)
+        content_list = list(context.content or [])
+        item["content"] = content_list
+        links_list = list(dict.fromkeys(context.links))
+        item["links"] = links_list
         if screenshot_bytes:
             item["screenshot"] = screenshot_bytes
         results.append(item)
@@ -284,7 +447,7 @@ class UniversalSpider(scrapy.Spider):
         download_timeout_sec = max(10, int(nav_timeout_ms / 1000) + 5)
 
         if self._follow and depth < self._max_depth:
-            for link in links:
+            for link in links_list:
                 if self._allowed and not self._is_allowed_domain(link):
                     continue
                 if looks_like_file(link):
@@ -314,56 +477,11 @@ class UniversalSpider(scrapy.Spider):
                             errback=self.on_request_error,
                         )
                     )
+
+        if context.requests:
+            results.extend(context.requests)
+
         return results
-
-    def on_request_error(self, failure: Failure):
-        request = failure.request
-        url = getattr(request, 'url', None) or (request and request.url)
-        depth = 0
-        try:
-            depth = int((request.cb_kwargs or {}).get('depth', 0))
-        except Exception:
-            pass
-
-        page = request.meta.pop("playwright_page", None) if request.meta else None
-        if page is not None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                try:
-                    loop = asyncio.get_event_loop()
-                except Exception:
-                    loop = None
-            if loop is not None:
-                try:
-                    loop.create_task(page.close())
-                except Exception:
-                    pass
-
-        msg = str(failure.value)
-        # If Playwright navigation triggers a download, retry as a direct file request
-        if 'Download is starting' in msg or 'download is starting' in msg:
-            self.logger.info(f"Retrying as file due to download start: {url}")
-            return scrapy.Request(url, callback=self.parse_file, cb_kwargs={'depth': depth}, dont_filter=True)
-
-        if request.meta and request.meta.get('playwright'):
-            retry_times = int(request.meta.get('playwright_retry_times', 0))
-            max_retries = int(request.meta.get('playwright_max_retries', self._max_playwright_retries))
-            if retry_times < max_retries:
-                new_meta = dict(request.meta)
-                new_meta.pop('playwright_page', None)
-                new_meta['playwright_retry_times'] = retry_times + 1
-                new_meta.setdefault('playwright_max_retries', max_retries)
-                self.logger.warning(
-                    f"Playwright request failed (attempt {retry_times + 1}/{max_retries}) for {url}: {msg}. Retrying..."
-                )
-                return request.replace(meta=new_meta, dont_filter=True)
-            else:
-                self.logger.error(
-                    f"Playwright request exhausted {retry_times} retries for {url}. Last error: {msg}"
-                )
-        else:
-            self.logger.warning(f"Playwright request failed: {msg} for {url}")
 
     @staticmethod
     def _extract_title(html: str) -> Optional[str]:
@@ -588,3 +706,7 @@ class UniversalSpider(scrapy.Spider):
         if "twitter.com" in host or host.endswith(".x.com") or host == "x.com":
             return "x"
         return "other"
+
+
+
+

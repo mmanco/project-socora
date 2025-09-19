@@ -42,7 +42,6 @@ def _slug_with_suffix(base_slug: str, index: int, max_len: int = MAX_SLUG_LEN) -
     return f"{trimmed}{suffix}"
 
 
-
 class OutputWriterPipeline:
     """
     Writes, for each item, a directory containing:
@@ -51,25 +50,6 @@ class OutputWriterPipeline:
     - screenshot.png (if screenshot bytes present in item)
     Files downloaded by FilesPipeline are referenced via the 'files' field.
     """
-
-    def _make_unique_slug(self, text: str, max_len: int = MAX_SLUG_LEN) -> str:
-        if not hasattr(self, '_slug_counts'):
-            self._slug_counts = {}
-        if not hasattr(self, '_used_slugs'):
-            self._used_slugs = set()
-        base_slug = _slugify(text, max_len=max_len)
-        count = self._slug_counts.get(base_slug, 0)
-        slug = base_slug
-        run_dir = getattr(self, "run_dir", None)
-        if slug in self._used_slugs or (run_dir and (run_dir / slug).exists()):
-            while True:
-                count += 1
-                slug = _slug_with_suffix(base_slug, count, max_len=max_len)
-                if slug not in self._used_slugs and not (run_dir and (run_dir / slug).exists()):
-                    break
-        self._slug_counts[base_slug] = count
-        self._used_slugs.add(slug)
-        return slug
 
     def open_spider(self, spider):
         settings = spider.settings
@@ -109,99 +89,6 @@ class OutputWriterPipeline:
         self._write_run_config(spider, run_id, base, files_store)
         spider.logger.info(f"Writing outputs to: {self.run_dir}")
 
-    def _collect_run_config(self, spider, run_id: str, base_dir: str, files_store: str | None) -> Dict[str, Any]:
-        config: Dict[str, Any] = {
-            "run_id": run_id,
-            "spider": getattr(spider, "name", spider.__class__.__name__),
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "output": {
-                "base_dir": str(base_dir),
-                "run_dir": str(self.run_dir),
-            },
-        }
-        if files_store:
-            config.setdefault("output", {})["files_store"] = str(files_store)
-        start_urls: List[str] = []
-        start_arg = getattr(spider, "_start_urls_arg", None)
-        if isinstance(start_arg, str):
-            start_urls.extend([u.strip() for u in start_arg.split(",") if u.strip()])
-        elif isinstance(start_arg, (list, tuple, set)):
-            start_urls.extend([str(u).strip() for u in start_arg if str(u).strip()])
-        start_attr = getattr(spider, "start_urls", None)
-        if isinstance(start_attr, (list, tuple, set)):
-            for u in start_attr:
-                s = str(u).strip()
-                if s:
-                    start_urls.append(s)
-        if start_urls:
-            dedup: List[str] = []
-            seen = set()
-            for url in start_urls:
-                if url not in seen:
-                    dedup.append(url)
-                    seen.add(url)
-            config["start_urls"] = dedup
-        url_file = getattr(spider, "_url_file", None)
-        if isinstance(url_file, str) and url_file.strip():
-            config["url_file"] = url_file.strip()
-        allowed_list: List[str] = []
-        for src in (getattr(spider, "_allowed", None), getattr(spider, "allowed_domains", None)):
-            if isinstance(src, (list, tuple, set)):
-                for val in src:
-                    s = str(val).strip()
-                    if s:
-                        allowed_list.append(s)
-        if allowed_list:
-            config["allowed_domains"] = sorted(dict.fromkeys(allowed_list))
-        spider_args: Dict[str, Any] = {}
-        follow = getattr(spider, "_follow", None)
-        if isinstance(follow, bool):
-            spider_args["follow_links"] = follow
-        max_depth = getattr(spider, "_max_depth", None)
-        if isinstance(max_depth, int):
-            spider_args["max_depth"] = max_depth
-        render_wait = getattr(spider, "_render_wait", None)
-        if isinstance(render_wait, str) and render_wait.strip():
-            spider_args["render_wait"] = render_wait.strip()
-        extractor_specs = getattr(spider, "_extractor_specs", None)
-        if extractor_specs:
-            spider_args["extractors"] = _json_safe(extractor_specs)
-        if spider_args:
-            config["spider_args"] = spider_args
-        settings_map: Dict[str, Any] = {}
-        try:
-            nav_timeout = spider.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT")
-            settings_map["playwright_default_navigation_timeout"] = nav_timeout
-        except Exception:
-            pass
-        if settings_map:
-            config["settings"] = settings_map
-        output_info = config.get("output")
-        if isinstance(output_info, dict):
-            config["output"] = {k: v for k, v in output_info.items() if v}
-        return {k: _json_safe(v) for k, v in config.items() if v not in (None, [], {}, set())}
-
-
-    def _write_run_config(self, spider, run_id: str, base_dir: str, files_store: str | None) -> None:
-        config = None
-        try:
-            config = self._collect_run_config(spider, run_id, base_dir, files_store)
-        except Exception as exc:
-            try:
-                spider.logger.debug(f"Failed to collect run config: {exc}")
-            except Exception:
-                pass
-        if not config:
-            return
-        cfg_path = self.run_dir / "run_config.json"
-        try:
-            with cfg_path.open("w", encoding="utf-8") as fh:
-                json.dump(config, fh, ensure_ascii=False, indent=2)
-        except Exception as exc:
-            try:
-                spider.logger.warning(f"Failed to write run_config.json: {exc}")
-            except Exception:
-                pass
     def process_item(self, item: Item | Dict[str, Any], spider):
         data: Dict[str, Any] = dict(item)
         files_info = data.get("files") or []
@@ -358,6 +245,119 @@ class OutputWriterPipeline:
 
         return item
 
+    def _make_unique_slug(self, text: str, max_len: int = MAX_SLUG_LEN) -> str:
+        if not hasattr(self, '_slug_counts'):
+            self._slug_counts = {}
+        if not hasattr(self, '_used_slugs'):
+            self._used_slugs = set()
+        base_slug = _slugify(text, max_len=max_len)
+        count = self._slug_counts.get(base_slug, 0)
+        slug = base_slug
+        run_dir = getattr(self, "run_dir", None)
+        if slug in self._used_slugs or (run_dir and (run_dir / slug).exists()):
+            while True:
+                count += 1
+                slug = _slug_with_suffix(base_slug, count, max_len=max_len)
+                if slug not in self._used_slugs and not (run_dir and (run_dir / slug).exists()):
+                    break
+        self._slug_counts[base_slug] = count
+        self._used_slugs.add(slug)
+        return slug
+
+    def _collect_run_config(self, spider, run_id: str, base_dir: str, files_store: str | None) -> Dict[str, Any]:
+        config: Dict[str, Any] = {
+            "run_id": run_id,
+            "spider": getattr(spider, "name", spider.__class__.__name__),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "output": {
+                "base_dir": str(base_dir),
+                "run_dir": str(self.run_dir),
+            },
+        }
+        if files_store:
+            config.setdefault("output", {})["files_store"] = str(files_store)
+        start_urls: List[str] = []
+        start_arg = getattr(spider, "_start_urls_arg", None)
+        if isinstance(start_arg, str):
+            start_urls.extend([u.strip() for u in start_arg.split(",") if u.strip()])
+        elif isinstance(start_arg, (list, tuple, set)):
+            start_urls.extend([str(u).strip() for u in start_arg if str(u).strip()])
+        start_attr = getattr(spider, "start_urls", None)
+        if isinstance(start_attr, (list, tuple, set)):
+            for u in start_attr:
+                s = str(u).strip()
+                if s:
+                    start_urls.append(s)
+        if start_urls:
+            dedup: List[str] = []
+            seen = set()
+            for url in start_urls:
+                if url not in seen:
+                    dedup.append(url)
+                    seen.add(url)
+            config["start_urls"] = dedup
+        url_file = getattr(spider, "_url_file", None)
+        if isinstance(url_file, str) and url_file.strip():
+            config["url_file"] = url_file.strip()
+        allowed_list: List[str] = []
+        for src in (getattr(spider, "_allowed", None), getattr(spider, "allowed_domains", None)):
+            if isinstance(src, (list, tuple, set)):
+                for val in src:
+                    s = str(val).strip()
+                    if s:
+                        allowed_list.append(s)
+        if allowed_list:
+            config["allowed_domains"] = sorted(dict.fromkeys(allowed_list))
+        spider_args: Dict[str, Any] = {}
+        follow = getattr(spider, "_follow", None)
+        if isinstance(follow, bool):
+            spider_args["follow_links"] = follow
+        max_depth = getattr(spider, "_max_depth", None)
+        if isinstance(max_depth, int):
+            spider_args["max_depth"] = max_depth
+        render_wait = getattr(spider, "_render_wait", None)
+        if isinstance(render_wait, str) and render_wait.strip():
+            spider_args["render_wait"] = render_wait.strip()
+        extractor_specs = getattr(spider, "_extractor_specs", None)
+        if extractor_specs:
+            spider_args["extractors"] = _json_safe(extractor_specs)
+        if spider_args:
+            config["spider_args"] = spider_args
+        settings_map: Dict[str, Any] = {}
+        try:
+            nav_timeout = spider.settings.getint("PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT")
+            settings_map["playwright_default_navigation_timeout"] = nav_timeout
+        except Exception:
+            pass
+        if settings_map:
+            config["settings"] = settings_map
+        output_info = config.get("output")
+        if isinstance(output_info, dict):
+            config["output"] = {k: v for k, v in output_info.items() if v}
+        return {k: _json_safe(v) for k, v in config.items() if v not in (None, [], {}, set())}
+
+
+    def _write_run_config(self, spider, run_id: str, base_dir: str, files_store: str | None) -> None:
+        config = None
+        try:
+            config = self._collect_run_config(spider, run_id, base_dir, files_store)
+        except Exception as exc:
+            try:
+                spider.logger.debug(f"Failed to collect run config: {exc}")
+            except Exception:
+                pass
+        if not config:
+            return
+        cfg_path = self.run_dir / "run_config.json"
+        try:
+            with cfg_path.open("w", encoding="utf-8") as fh:
+                json.dump(config, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            try:
+                spider.logger.warning(f"Failed to write run_config.json: {exc}")
+            except Exception:
+                pass
+
 
 class TikaExtractPipeline:
     """
@@ -379,6 +379,77 @@ class TikaExtractPipeline:
             spider.logger.info(
                 "TIKA_SERVER_URL not set. Falling back to local Tika at http://localhost:9998"
             )
+
+    def process_item(self, item: Item | Dict[str, Any], spider):
+        if not self.server_url or not self.files_store:
+            return item
+
+        data: Dict[str, Any] = dict(item)
+        files_info = data.get("files") or []
+        if not files_info:
+            return item
+
+        tika_results = []
+        for f in files_info:
+            rel = f.get("path")
+            if not rel:
+                continue
+            abs_path = self.files_store / rel
+            text = None
+            meta = None
+            try:
+                if abs_path.exists():
+                    text, meta = extract_with_tika(abs_path, self.server_url, timeout=self.timeout)
+            except TikaError as e:
+                spider.logger.warning(f"Tika extraction failed for {abs_path}: {e}")
+            # Try to rename file to have a proper extension if missing
+            new_rel = rel
+            try:
+                mime_hint = self._mime_from_tika_meta(meta)
+                if not mime_hint:
+                    content_type = data.get("content_type")
+                    if isinstance(content_type, str):
+                        mime_hint = content_type.split(";", 1)[0].strip() or None
+                if not mime_hint:
+                    mime_hint = self._mime_from_magic(abs_path)
+                want_ext = self._ext_from_mime(mime_hint) if mime_hint else None
+                suffix = Path(rel).suffix
+                normalized_suffix = suffix.lower() if suffix else ""
+                normalized_want = want_ext.lower() if want_ext else ""
+                needs_rename = False
+                if want_ext and (not suffix or normalized_suffix != normalized_want):
+                    needs_rename = True
+                if needs_rename:
+                    target = Path(rel).with_suffix(want_ext)
+                    target_abs = self.files_store / target
+                    target_abs.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        abs_path.rename(target_abs)
+                        new_rel = str(target)
+                        f["path"] = new_rel
+                        # Also update abs_path for any downstream use
+                        abs_path = target_abs
+                        spider.logger.info(f"Renamed downloaded file based on MIME {mime_hint}: {rel} -> {new_rel}")
+                    except Exception as re:
+                        spider.logger.warning(f"Could not rename {abs_path} to {target_abs}: {re}")
+            except Exception as e:
+                spider.logger.debug(f"Extension inference failed for {rel}: {e}")
+
+            tika_results.append({
+                "path": str(new_rel),
+                "text": text,
+                "metadata": meta,
+            })
+
+        if tika_results:
+            item["tika"] = tika_results
+            # If no page content present, but we have text from Tika, use the first non-empty
+            if not item.get("html") and not item.get("text"):
+                first_text = next((r["text"] for r in tika_results if r.get("text")), None)
+                if first_text:
+                    item["text"] = first_text
+
+        return item            
 
     def _ext_from_mime(self, mime: str | None) -> str | None:
         if not mime:
@@ -468,75 +539,4 @@ class TikaExtractPipeline:
         if ascii_head.startswith("[") and "]" in ascii_head:
             return "application/json"
         return None
-
-    def process_item(self, item: Item | Dict[str, Any], spider):
-        if not self.server_url or not self.files_store:
-            return item
-
-        data: Dict[str, Any] = dict(item)
-        files_info = data.get("files") or []
-        if not files_info:
-            return item
-
-        tika_results = []
-        for f in files_info:
-            rel = f.get("path")
-            if not rel:
-                continue
-            abs_path = self.files_store / rel
-            text = None
-            meta = None
-            try:
-                if abs_path.exists():
-                    text, meta = extract_with_tika(abs_path, self.server_url, timeout=self.timeout)
-            except TikaError as e:
-                spider.logger.warning(f"Tika extraction failed for {abs_path}: {e}")
-            # Try to rename file to have a proper extension if missing
-            new_rel = rel
-            try:
-                mime_hint = self._mime_from_tika_meta(meta)
-                if not mime_hint:
-                    content_type = data.get("content_type")
-                    if isinstance(content_type, str):
-                        mime_hint = content_type.split(";", 1)[0].strip() or None
-                if not mime_hint:
-                    mime_hint = self._mime_from_magic(abs_path)
-                want_ext = self._ext_from_mime(mime_hint) if mime_hint else None
-                suffix = Path(rel).suffix
-                normalized_suffix = suffix.lower() if suffix else ""
-                normalized_want = want_ext.lower() if want_ext else ""
-                needs_rename = False
-                if want_ext and (not suffix or normalized_suffix != normalized_want):
-                    needs_rename = True
-                if needs_rename:
-                    target = Path(rel).with_suffix(want_ext)
-                    target_abs = self.files_store / target
-                    target_abs.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        abs_path.rename(target_abs)
-                        new_rel = str(target)
-                        f["path"] = new_rel
-                        # Also update abs_path for any downstream use
-                        abs_path = target_abs
-                        spider.logger.info(f"Renamed downloaded file based on MIME {mime_hint}: {rel} -> {new_rel}")
-                    except Exception as re:
-                        spider.logger.warning(f"Could not rename {abs_path} to {target_abs}: {re}")
-            except Exception as e:
-                spider.logger.debug(f"Extension inference failed for {rel}: {e}")
-
-            tika_results.append({
-                "path": str(new_rel),
-                "text": text,
-                "metadata": meta,
-            })
-
-        if tika_results:
-            item["tika"] = tika_results
-            # If no page content present, but we have text from Tika, use the first non-empty
-            if not item.get("html") and not item.get("text"):
-                first_text = next((r["text"] for r in tika_results if r.get("text")), None)
-                if first_text:
-                    item["text"] = first_text
-
-        return item
 

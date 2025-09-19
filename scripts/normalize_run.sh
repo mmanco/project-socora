@@ -44,10 +44,10 @@ export PYTHONIOENCODING=utf-8
 while IFS= read -r -d '' d; do
   if [[ -f "$d/content.json" ]]; then
     echo "- $d/content.json"
-    uv run python -m socora_crawler.normalize_text_content "$d/content.json" "$@" > "$d/content.md"
+    uv run python -m socora_crawler.normalize_content "$d/content.json" "$@" > "$d/content.md"
   elif [[ -f "$d/content.txt" ]]; then
     echo "- $d/content.txt"
-    uv run python -m socora_crawler.normalize_text_content "$d/content.txt" "$@" > "$d/content.md"
+    uv run python -m socora_crawler.normalize_content "$d/content.txt" "$@" > "$d/content.md"
   else
     echo "[WARN] Missing content.json and content.txt: $d"
   fi

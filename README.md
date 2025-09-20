@@ -127,7 +127,9 @@ uv run scrapy crawl universal -a url_file=seeds.txt -s ROBOTSTXT_OBEY=false
 uv run scrapy crawl universal \
   -a start_urls="https://example.com" \
   -a allowed="example.com,static.example.com" \
-  -a follow_links=true -a max_depth=2 \
+  -a follow_links=true 
+  -a max_depth=2 \
+  -a extractors="" \
   -s SCRAPY_OUTPUT_DIR=./output -s FILES_STORE=./output/files -s ROBOTSTXT_OBEY=true
 ```
 

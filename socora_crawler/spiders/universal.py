@@ -108,6 +108,22 @@ class UniversalSpider(scrapy.Spider):
 
         return spider
 
+    async def _close_playwright_page(
+        self,
+        page: Any,
+        url: Optional[str] = None,
+    ) -> None:
+        if page is None:
+            return
+        try:
+            await page.close()
+        except Exception as exc:
+            self.logger.debug(
+                "Ignoring error while closing Playwright page for %s: %s",
+                url or "<unknown>",
+                exc,
+            )
+
     async def start(self) -> AsyncIterator[Request]:
         for req in self._iter_start_requests():
             yield req
@@ -121,10 +137,7 @@ class UniversalSpider(scrapy.Spider):
             except Exception as exc:
                 self.logger.warning(f"Screenshot capture failed for {response.url}: {exc}")
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await self._close_playwright_page(page, response.url)
 
         html = response.text or ""
         title = self._extract_title(html)
@@ -197,7 +210,7 @@ class UniversalSpider(scrapy.Spider):
                     loop = None
             if loop is not None:
                 try:
-                    loop.create_task(page.close())
+                    loop.create_task(self._close_playwright_page(page, url))
                 except Exception:
                     pass
 

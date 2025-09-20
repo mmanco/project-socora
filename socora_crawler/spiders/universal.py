@@ -72,11 +72,6 @@ def looks_like_file(url: str) -> bool:
 class UniversalSpider(scrapy.Spider):
     name = "universal"
 
-    custom_settings = {
-        # Make sure file pipeline has a place to store outputs
-        # Users can override via -s FILES_STORE=...
-    }
-
     def __init__(
         self,
         start_urls: Optional[str] = None,

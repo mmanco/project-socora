@@ -139,10 +139,22 @@ class UniversalSpider(scrapy.Spider):
             finally:
                 await self._close_playwright_page(page, response.url)
 
+        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
+        if not self._should_treat_response_as_html(content_type, response.body):
+            file_result = self.parse_file(response, depth)
+            def _attach_screenshot(result: Any) -> None:
+                if not screenshot_bytes or not isinstance(result, dict):
+                    return
+                result.setdefault("screenshot", screenshot_bytes)
+            if isinstance(file_result, list):
+                for entry in file_result:
+                    _attach_screenshot(entry)
+                return file_result
+            _attach_screenshot(file_result)
+            return [file_result]
         html = response.text or ""
         title = self._extract_title(html)
         links = self._extract_links(response)
-        content_type = response.headers.get("Content-Type", b"").decode("latin-1")
         content_blocks = self._extract_content_blocks(response)
         
         return self._build_page_results(
@@ -400,6 +412,16 @@ class UniversalSpider(scrapy.Spider):
 
     def _should_treat_response_as_html(self, content_type: str, body: bytes) -> bool:
         ctype = (content_type or "").lower()
+        if ctype:
+            ctype_main = ctype.split(';', 1)[0].strip()
+            if ctype_main in {"application/pdf", "application/x-pdf", "application/octet-stream", "binary/octet-stream"}:
+                return False
+            if ctype_main.startswith(("image/", "audio/", "video/")):
+                return False
+            if ctype_main.startswith("application/"):
+                guessed_ext = mimetypes.guess_extension(ctype_main)
+                if guessed_ext and guessed_ext in FILE_EXTENSIONS:
+                    return False
         if "text/html" in ctype or "application/xhtml" in ctype:
             return True
         if not body:

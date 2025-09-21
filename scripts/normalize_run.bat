@@ -54,6 +54,10 @@ if not exist "%RUN_DIR%" (
 
 set "EXTRA_ARGS=%*"
 set "PYTHONIOENCODING=utf-8"
+REM Avoid per-invocation environment churn by uv (faster and more stable on Windows)
+set "UV_NO_SYNC=1"
+REM Silence hardlink fallback warning on filesystems that don't support it
+set "UV_LINK_MODE=copy"
 
 echo Normalizing run: %RUN_DIR%
 
@@ -61,10 +65,10 @@ REM Iterate page directories once; prefer text_content.json over content.txt; wa
 for /d %%D in ("%RUN_DIR%\*") do (
   if exist "%%D\content.json" (
     echo - %%D\content.json
-    uv run python -m socora_crawler.normalize_content "%%D\content.json" %EXTRA_ARGS% > "%%D\content.md"
+    uv run --no-sync python -m socora_crawler.normalize_content "%%D\content.json" %EXTRA_ARGS% > "%%D\content.md"
   ) else if exist "%%D\content.txt" (
     echo - %%D\content.txt
-    uv run python -m socora_crawler.normalize_content "%%D\content.txt" %EXTRA_ARGS% > "%%D\content.md"
+    uv run --no-sync python -m socora_crawler.normalize_content "%%D\content.txt" %EXTRA_ARGS% > "%%D\content.md"
   ) else (
     echo [WARN] Missing content.json and content.txt: %%D
   )

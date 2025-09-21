@@ -33,7 +33,7 @@ where residents can access knowledge, administrators can manage with clarity, an
 
 - **Python Scrapy + Playwright** – JS-rendered crawling, file detection/downloads; uv-managed environment.
 - **Apache Tika (server)** – MIME detection and robust text/metadata extraction from downloaded files (Docker-compose helper included).
-- **Elasticsearch** – Scalable indexing and semantic search across structured and unstructured data.
+- **Opensearch** – Scalable indexing and semantic search across structured and unstructured data.
 - **Redis** – Frontier/state scheduling (planned integration for large-scale crawling).
 - **AI Agents + RAG** – Retrieval-Augmented Generation layer to answer natural language questions.
 - **Chrome Extension (initial client)** – Residents can install and ask direct questions about their community.
@@ -47,7 +47,7 @@ where residents can access knowledge, administrators can manage with clarity, an
    File links are downloaded; Apache Tika extracts MIME, text, and metadata.
 
 2. **Index & Store**  
-   Parsed content is indexed in Elasticsearch with change detection.  
+   Parsed content is indexed in Opensearch with change detection.  
    Redis (planned) will track crawl state and prevent wasteful re-fetching.
 
 3. **Query & Answer**  
@@ -65,7 +65,7 @@ where residents can access knowledge, administrators can manage with clarity, an
 ## 🚀 Roadmap
 
 - [ ] Core crawler + parsing pipeline (Scrapy + Playwright + Tika).
-- [ ] Elasticsearch integration with change-aware indexing.
+- [ ] Opensearch integration with change-aware indexing.
 - [ ] AI RAG agent prototype over indexed data.
 - [ ] Chrome extension for end-user Q&A.
 - [ ] Dedicated dashboard for monitoring targets and usage.
@@ -130,7 +130,8 @@ uv run scrapy crawl universal \
   -a follow_links=true 
   -a max_depth=2 \
   -a extractors="" \
-  -s SCRAPY_OUTPUT_DIR=./output -s FILES_STORE=./output/files -s ROBOTSTXT_OBEY=true
+  -s SCRAPY_OUTPUT_DIR=./output  
+  -s ROBOTSTXT_OBEY=true
 ```
 
 ### Normalize Extracted Text (Markdown)
@@ -178,7 +179,7 @@ End-to-end sequence for a typical run:
   - Windows: `.containers\tika\run.bat`
 - Run the crawler (examples):
   - `scripts\run_cresskill.bat` (Windows), or
-  - `uv run scrapy crawl universal -a start_urls="https://example.com" -s SCRAPY_OUTPUT_DIR=./output -s FILES_STORE=./output/files -s ROBOTSTXT_OBEY=false`
+  - `uv run scrapy crawl universal -a start_urls="https://example.com" -s SCRAPY_OUTPUT_DIR=./output -s ROBOTSTXT_OBEY=false`
 
 2) Normalize page text to Markdown
 
@@ -228,7 +229,7 @@ End-to-end sequence for a typical run:
 
 ### Indexing (Overview)
 
-Suggested indices for search systems (e.g., Elasticsearch):
+Suggested indices for search systems (e.g., Opensearch):
 
 - Pages index
   - `url` (keyword): page URL
@@ -276,7 +277,7 @@ Enable Tika in this project by setting the server URL:
 ```
 # Windows PowerShell example
 $env:TIKA_SERVER_URL = "http://localhost:9998"
-uv run scrapy crawl universal -a start_urls="https://example.com" -s FILES_STORE=./output/files
+uv run scrapy crawl universal -a start_urls="https://example.com"
 ```
 
 What it does:
@@ -305,7 +306,7 @@ Outputs are written to `output/run-YYYYmmdd-HHMMSS/` with one folder per URL, co
 - `metadata.json` with URL, final URL, status, title, timestamp, content type, links, and any downloaded file references
 - `content.json` listing content elements (text nodes and embeds) in order of appearance for the page
 
-Downloaded files are stored under `output/files/<RUN_ID>/` by default (override with `-s FILES_STORE=...`). Metadata includes the `files` array; each `path` is prefixed with `<RUN_ID>/...` so it is relative to `output/files/`.
+Downloaded files are saved inside each page folder under `files/`. The `files` array in `metadata.json` lists paths relative to the page directory.
 
 ### Notes and Tips
 

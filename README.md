@@ -179,7 +179,7 @@ End-to-end sequence for a typical run:
   - Windows: `.containers\tika\run.bat`
 - Run the crawler (examples):
   - `scripts\run_cresskill.bat` (Windows), or
-  - `uv run scrapy crawl universal -a start_urls="https://example.com" -s SCRAPY_OUTPUT_DIR=./output -s ROBOTSTXT_OBEY=false`
+  - `uv run scrapy crawl universal -a start_urls="https://example.com" -s SCRAPY_OUTPUT_DIR=./output -s FILES_STORE=./output/files -s ROBOTSTXT_OBEY=false`
 
 2) Normalize page text to Markdown
 
@@ -277,14 +277,14 @@ Enable Tika in this project by setting the server URL:
 ```
 # Windows PowerShell example
 $env:TIKA_SERVER_URL = "http://localhost:9998"
-uv run scrapy crawl universal -a start_urls="https://example.com"
+uv run scrapy crawl universal -a start_urls="https://example.com" -s FILES_STORE=./output/files
 ```
 
 What it does:
 
 - After FilesPipeline downloads a file, it sends it to Tika for text and metadata.
 - Adds `tika` to each item (per-file text + metadata) and, when no page HTML is present, stores extracted text to `text` so `content.txt` is written.
- - If a downloaded file has no extension, the Tika pipeline will rename it to include a suitable extension based on the detected MIME type (e.g., .pdf, .docx, .ics), and update item references accordingly.
+- Downloaded files are stored under `output/files/<RUN_ID>/` by default (override with `-s FILES_STORE=...`). Metadata includes the `files` array; each `path` is prefixed with `<RUN_ID>/...` so it is relative to `output/files/`.
 
 Notes:
 

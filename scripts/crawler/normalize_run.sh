@@ -1,53 +1,54 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cd to repo root (dir containing pyproject.toml)
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="${SCRIPT_DIR}/.."
-if [[ -f "${ROOT_DIR}/pyproject.toml" ]]; then
-  cd "${ROOT_DIR}"
-else
-  if [[ -f pyproject.toml ]]; then
-    : # already in root
-  else
-    ROOT_FROM_GIT=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    if [[ -n "${ROOT_FROM_GIT}" && -f "${ROOT_FROM_GIT}/pyproject.toml" ]]; then
-      cd "${ROOT_FROM_GIT}"
-    fi
-  fi
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+CRAWLER_DIR="${REPO_ROOT}/socora-crawler"
+RUN_ROOT="${REPO_ROOT}/output"
+
+if [[ ! -f "${CRAWLER_DIR}/pyproject.toml" ]]; then
+  echo "[ERROR] Could not locate socora-crawler project at ${CRAWLER_DIR}" >&2
+  exit 1
 fi
 
-# First arg can be a run dir; otherwise detect latest under output/run-*
+cd "${CRAWLER_DIR}"
+
 RUN_DIR=""
-if [[ $# -gt 0 && "$1" != -* ]]; then
+if [[ $# -gt 0 && $1 != -* ]]; then
   RUN_DIR="$1"
   shift
 fi
 
+if [[ -n "${RUN_DIR}" && "${RUN_DIR}" != /* ]]; then
+  if [[ -d "${REPO_ROOT}/${RUN_DIR}" ]]; then
+    RUN_DIR="${REPO_ROOT}/${RUN_DIR}"
+  fi
+fi
+
 if [[ -z "${RUN_DIR}" ]]; then
-  if [[ -d output ]]; then
-    # shellcheck disable=SC2012
-    RUN_DIR=$(ls -1dt output/run-* 2>/dev/null | head -n1 || true)
+  if [[ -d "${RUN_ROOT}" ]]; then
+    RUN_DIR=$(ls -1dt "${RUN_ROOT}"/run-* 2>/dev/null | head -n1 || true)
   fi
 fi
 
 if [[ -z "${RUN_DIR}" || ! -d "${RUN_DIR}" ]]; then
-  echo "Usage: scripts/normalize_run.sh [output/run-YYYYmmdd-HHMMSS] [--force-commonalities] [--common-threshold 0.5]" >&2
+  echo "Usage: scripts/crawler/normalize_run.sh [output/run-YYYYmmdd-HHMMSS] [--force-commonalities] [--common-threshold 0.5]" >&2
   exit 1
 fi
 
 echo "Normalizing run: ${RUN_DIR}"
 
 export PYTHONIOENCODING=utf-8
+export UV_NO_SYNC=1
+export UV_LINK_MODE=copy
 
-# Process each page directory once, preferring content.json over content.txt
 while IFS= read -r -d '' d; do
   if [[ -f "$d/content.json" ]]; then
     echo "- $d/content.json"
-    uv run python -m socora_crawler.normalize_content "$d/content.json" "$@" > "$d/content.md"
+    uv run --no-sync python -m socora_crawler.normalize_content "$d/content.json" "$@" > "$d/content.md"
   elif [[ -f "$d/content.txt" ]]; then
     echo "- $d/content.txt"
-    uv run python -m socora_crawler.normalize_content "$d/content.txt" "$@" > "$d/content.md"
+    uv run --no-sync python -m socora_crawler.normalize_content "$d/content.txt" "$@" > "$d/content.md"
   else
     echo "[WARN] Missing content.json and content.txt: $d"
   fi

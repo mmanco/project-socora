@@ -1,43 +1,49 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal EnableExtensions EnableDelayedExpansion
 
-REM Find project root (folder containing pyproject.toml)
 set "SCRIPT_DIR=%~dp0"
-set "ROOT_DIR=%SCRIPT_DIR%.."
-set "DID_PUSHD="
+pushd "%SCRIPT_DIR%..\.." >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] Unable to resolve repository root from %SCRIPT_DIR%
+  exit /b 1
+)
+set "REPO_ROOT=%CD%"
+set "CRAWLER_DIR=%REPO_ROOT%\socora-crawler"
+set "HELPER_PATH=%REPO_ROOT%\scripts\crawler\find_empty_content_md.py"
 
-if exist "%ROOT_DIR%\pyproject.toml" (
-  pushd "%ROOT_DIR%"
-  set "DID_PUSHD=1"
-) else if exist "pyproject.toml" (
-  REM Already in project root
-) else (
-  for /f "delims=" %%i in ('git rev-parse --show-toplevel 2^>nul') do set "ROOT_DIR=%%i"
-  if defined ROOT_DIR if exist "%ROOT_DIR%\pyproject.toml" (
-    pushd "%ROOT_DIR%"
-    set "DID_PUSHD=1"
-  ) else (
-    echo [WARN] Could not locate project root containing pyproject.toml. Running from current directory.
+if not exist "%CRAWLER_DIR%\pyproject.toml" (
+  echo [ERROR] Could not locate socora-crawler project at %CRAWLER_DIR%
+  popd >nul
+  exit /b 1
+)
+
+set "BASE_DIR=%~1"
+if "%BASE_DIR%"=="" set "BASE_DIR=%REPO_ROOT%\output"
+
+if not "%BASE_DIR:~1,1%"==":" (
+  if exist "%REPO_ROOT%\%BASE_DIR%" (
+    set "BASE_DIR=%REPO_ROOT%\%BASE_DIR%"
   )
 )
 
-REM Base directory to scan (default: output)
-set "BASE_DIR=%~1"
-if "%BASE_DIR%"=="" set "BASE_DIR=output"
-
 if not exist "%BASE_DIR%" (
   echo [ERROR] Base directory not found: %BASE_DIR%
-  if defined DID_PUSHD popd
+  popd >nul
   exit /b 2
 )
 
-REM Keep uv from re-syncing per invocation; avoid hardlink warnings
 set "UV_NO_SYNC=1"
 set "UV_LINK_MODE=copy"
 set "PYTHONIOENCODING=utf-8"
 
-uv run --no-sync python scripts/find_empty_content_md.py "%BASE_DIR%"
+pushd "%CRAWLER_DIR%" >nul
+set "CRAWLER_PUSHED=1"
 
-if defined DID_PUSHD popd
+uv run --no-sync python "%HELPER_PATH%" "%BASE_DIR%"
+
+goto :cleanup
+
+:cleanup
+if defined CRAWLER_PUSHED popd >nul
+popd >nul
 endlocal
-

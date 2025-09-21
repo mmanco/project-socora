@@ -5,7 +5,7 @@ after the YAML front matter AND metadata.json either has no "files"
 property or has an empty "files": [] list.
 
 Usage:
-  python scripts/find_empty_content_md.py [BASE_DIR]
+  python scripts/crawler/find_empty_content_md.py [BASE_DIR]
 
 - BASE_DIR defaults to "output" (the project output root).
 - Prints one directory path per line for each page whose content.md has no

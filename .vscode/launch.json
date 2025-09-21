@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: Run/Debug Cresskill Crawler",
+      "name": "Python: Run/Debug Crawler",
       "type": "debugpy",
       "request": "launch",
       "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",

@@ -2,25 +2,45 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Python: Run/Debug Crawler",
+      "name": "Crawler: Universal Spider",
       "type": "debugpy",
       "request": "launch",
-      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "python": "${workspaceFolder}/socora-crawler/.venv/Scripts/python.exe",
       "module": "scrapy",
-      "cwd": "${workspaceFolder}",
+      "cwd": "${workspaceFolder}/socora-crawler",
       "console": "integratedTerminal",
       "justMyCode": false,
       "args": [
         "crawl",
         "universal",
-        "-a", "start_urls=${input:startUrls}",
-        "-a", "allowed=${input:allowedDomains}",
-        "-a", "follow_links=true",
-        "-a", "max_depth=${input:maxDepth}",
-        "-a", "extractors=${input:extractors}",
-        "-s", "ROBOTSTXT_OBEY=true",
-        "-s", "SCRAPY_OUTPUT_DIR=./output"
+        "-a",
+        "start_urls=${input:startUrls}",
+        "-a",
+        "allowed=${input:allowedDomains}",
+        "-a",
+        "follow_links=true",
+        "-a",
+        "max_depth=${input:maxDepth}",
+        "-a",
+        "extractors=${input:extractors}",
+        "-s",
+        "ROBOTSTXT_OBEY=true",
+        "-s",
+        "SCRAPY_OUTPUT_DIR=../output"
       ]
+    },
+    {
+      "name": "Indexer: LlamaIndex Main",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/socora-indexer/.venv/Scripts/python.exe",
+      "program": "${workspaceFolder}/socora-indexer/main.py",
+      "cwd": "${workspaceFolder}/socora-indexer",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "SOCORA_ENV": "dev"
+      }
     }
   ],
   "inputs": [

@@ -30,17 +30,69 @@
       ]
     },
     {
-      "name": "Indexer: LlamaIndex Main",
+      "name": "Indexer: Main",
       "type": "debugpy",
       "request": "launch",
       "python": "${workspaceFolder}/socora-indexer/.venv/Scripts/python.exe",
       "program": "${workspaceFolder}/socora-indexer/main.py",
       "cwd": "${workspaceFolder}/socora-indexer",
       "console": "integratedTerminal",
-      "justMyCode": true,
+      "justMyCode": false,
       "env": {
         "SOCORA_ENV": "dev"
-      }
+      },
+      "args": [
+        "--run-dir",
+        "${workspaceFolder}/output/${input:indexerRunId}",
+        "--opensearch-endpoint",
+        "${input:opensearchEndpoint}",
+        "--opensearch-index",
+        "${input:opensearchIndex}",
+        "--opensearch-username=${input:opensearchUsername}",
+        "--opensearch-password=${input:opensearchPassword}",
+        "--opensearch-option=${input:opensearchOption}",
+        "--ollama-base-url",
+        "${input:ollamaBaseUrl}",
+        "--ollama-model",
+        "${input:ollamaModel}",
+        "--embed-batch-size",
+        "${input:embedBatchSize}",
+        "--semantic-buffer-size",
+        "${input:semanticBufferSize}",
+        "--semantic-breakpoint-percentile",
+        "${input:semanticBreakpointPercentile}",
+        "--embedding-dimension",
+        "${input:embeddingDimension}",
+        "--metadata=${input:indexerMetadata}"
+      ]
+    },
+    {
+      "name": "Chatbot: CLI Agent",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/socora-indexer/.venv/Scripts/python.exe",
+      "program": "${workspaceFolder}/socora-indexer/socora_indexer/cli_agent.py",
+      "cwd": "${workspaceFolder}/socora-indexer",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "--opensearch-endpoint",
+        "${input:opensearchEndpoint}",
+        "--opensearch-index",
+        "${input:opensearchIndex}",
+        "--opensearch-username=${input:opensearchUsername}",
+        "--opensearch-password=${input:opensearchPassword}",
+        "--opensearch-option=${input:opensearchOption}",
+        "--embedding-dimension",
+        "${input:embeddingDimension}",
+        "--ollama-base-url",
+        "${input:ollamaBaseUrl}",
+        "--ollama-embed-model",
+        "${input:ollamaModel}",
+        "--ollama-llm-model",
+        "${input:ollamaChatModel}",
+        "--show-sources"
+      ]
     }
   ],
   "inputs": [
@@ -67,6 +119,90 @@
       "type": "promptString",
       "description": "Extractors (comma-separated)",
       "default": "extractors.cresskill.meeting_documents"
+    },
+    {
+      "id": "indexerRunId",
+      "type": "promptString",
+      "description": "Crawler run folder name under output/",
+      "default": "run-20250920-220348"
+    },
+    {
+      "id": "opensearchEndpoint",
+      "type": "promptString",
+      "description": "OpenSearch endpoint URL",
+      "default": "http://localhost:9200"
+    },
+    {
+      "id": "opensearchIndex",
+      "type": "promptString",
+      "description": "OpenSearch index name",
+      "default": "socora-cresskill"
+    },
+    {
+      "id": "opensearchUsername",
+      "type": "promptString",
+      "description": "OpenSearch basic auth username",
+      "default": "admin"
+    },
+    {
+      "id": "opensearchPassword",
+      "type": "promptString",
+      "description": "OpenSearch basic auth password",
+      "default": "admin",
+    },
+    {
+      "id": "opensearchOption",
+      "type": "promptString",
+      "description": "Single OpenSearch client option (key=value)",
+      "default": "verify_certs=false"
+    },
+    {
+      "id": "ollamaBaseUrl",
+      "type": "promptString",
+      "description": "Ollama base URL",
+      "default": "http://localhost:11434"
+    },
+    {
+      "id": "ollamaModel",
+      "type": "promptString",
+      "description": "Ollama embedding model id",
+      "default": "nomic-embed-text:v1.5"
+    },
+    {
+      "id": "embedBatchSize",
+      "type": "promptString",
+      "description": "Embedding batch size",
+      "default": "32"
+    },
+    {
+      "id": "semanticBufferSize",
+      "type": "promptString",
+      "description": "Semantic splitter buffer size",
+      "default": "2"
+    },
+    {
+      "id": "semanticBreakpointPercentile",
+      "type": "promptString",
+      "description": "Semantic splitter breakpoint percentile",
+      "default": "92"
+    },
+    {
+      "id": "embeddingDimension",
+      "type": "promptString",
+      "description": "Embedding dimensionality expected by OpenSearch",
+      "default": "768"
+    },
+    {
+      "id": "indexerMetadata",
+      "type": "promptString",
+      "description": "Additional metadata key=value pair",
+      "default": "municipality=Cresskill"
+    },
+    {
+      "id": "ollamaChatModel",
+      "type": "promptString",
+      "description": "Ollama chat model id",
+      "default": "gemma3:12b"
     }
   ]
 }

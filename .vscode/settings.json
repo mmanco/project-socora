@@ -2,8 +2,26 @@
   "java.compile.nullAnalysis.mode": "automatic",
   "python-envs.defaultEnvManager": "ms-python.python:system",
   "python-envs.pythonProjects": [
-    { "path": "${workspaceFolder}/socora-crawler" },
-    { "path": "${workspaceFolder}/socora-indexer" }
+    {
+      "path": "${workspaceFolder}/socora-crawler",
+      "envManager": "ms-python.python:system",
+      "packageManager": "ms-python.python:pip"
+    },
+    {
+      "path": "${workspaceFolder}/socora-indexer",
+      "envManager": "ms-python.python:system",
+      "packageManager": "ms-python.python:pip"
+    },
+    {
+      "path": "socora-crawler",
+      "envManager": "ms-python.python:system",
+      "packageManager": "ms-python.python:pip"
+    },
+    {
+      "path": "socora-indexer",
+      "envManager": "ms-python.python:venv",
+      "packageManager": "ms-python.python:pip"
+    }
   ],
   "python.defaultInterpreterPath": "${workspaceFolder}/socora-crawler/.venv/Scripts/python.exe",
   "python.analysis.extraPaths": [

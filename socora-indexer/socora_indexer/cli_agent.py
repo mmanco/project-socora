@@ -12,8 +12,13 @@ if __package__ in (None, ""):
 from llama_index.core import StorageContext, VectorStoreIndex
 from llama_index.core.agent.workflow.function_agent import FunctionAgent
 from llama_index.core.agent.workflow.workflow_events import AgentOutput, ToolCallResult
+from llama_index.core.base.base_retriever import BaseRetriever
+from llama_index.core.callbacks.base import CallbackManager
+from llama_index.core.query_engine.retriever_query_engine import RetrieverQueryEngine
+from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.tools import QueryEngineTool
-from llama_index.core.vector_stores.types import ExactMatchFilter, MetadataFilters
+from llama_index.core.vector_stores.types import VectorStoreQueryMode
+from llama_index.core.tools import QueryEngineTool
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.opensearch import (
@@ -24,29 +29,119 @@ from llama_index.vector_stores.opensearch import (
 from socora_indexer.opensearch_utils import ensure_opensearch_index
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
-DEFAULT_SYSTEM_PROMPT = "You are Socora's civic knowledge assistant. Socora helps municipalities, schools, and local institutions make public records accessible and searchable for the community. Local governments and schools often communicate through fragmented websites and static documents. Socora.ai makes this information accessible by crawling and indexing municipal websites, agendas, meeting minutes, and forms, parsing files into structured, searchable data, and enabling residents to ask direct questions about their town, school district, or community services. Socora is building a civic operating system where residents can access knowledge, administrators can manage with clarity, and AI ensures data is not hidden in PDFs but available to all. Answer questions using the indexed civic content. Highlight reliable information that helps residents, administrators, and community stakeholders understand local services, governance, and programs."
-
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+class _HybridBM25Retriever(BaseRetriever):
+    """Combine embedding and lexical (BM25) retrieval with weighted reranking."""
+
+    def __init__(
+        self,
+        *,
+        index: VectorStoreIndex,
+        similarity_top_k: int,
+        bm25_top_k: int,
+        alpha: float,
+    ) -> None:
+        self._index = index
+        self._vector_retriever = index.as_retriever(similarity_top_k=similarity_top_k)
+        self._vector_store = index.vector_store
+        self._bm25_top_k = max(1, bm25_top_k)
+        self._alpha = max(0.0, min(alpha, 1.0))
+        self._target_top_k = similarity_top_k
+        dim = getattr(self._vector_store, '_dim', 0) or 0
+        self._dummy_embedding = [0.0] * dim
+        callback_manager = getattr(self._vector_retriever, 'callback_manager', None)
+        super().__init__(callback_manager=callback_manager)
+
+    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        vector_nodes = self._vector_retriever.retrieve(query_bundle)
+        bm25_nodes = self._bm25_search(query_bundle.query_str)
+        return self._combine(vector_nodes, bm25_nodes)
+
+    async def _aretrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        vector_nodes = await self._vector_retriever.aretrieve(query_bundle)
+        bm25_nodes = await self._abm25_search(query_bundle.query_str)
+        return self._combine(vector_nodes, bm25_nodes)
+
+    def _bm25_search(self, query_str: Optional[str]) -> List[NodeWithScore]:
+        if not query_str:
+            return []
+        result = self._vector_store.query(
+            VectorStoreQueryMode.TEXT_SEARCH,
+            query_str,
+            self._dummy_embedding,
+            self._bm25_top_k,
+        )
+        return self._nodes_from_result(result)
+
+    async def _abm25_search(self, query_str: Optional[str]) -> List[NodeWithScore]:
+        if not query_str:
+            return []
+        result = await self._vector_store.aquery(
+            VectorStoreQueryMode.TEXT_SEARCH,
+            query_str,
+            self._dummy_embedding,
+            self._bm25_top_k,
+        )
+        return self._nodes_from_result(result)
+
+    def _nodes_from_result(self, result) -> List[NodeWithScore]:
+        if not result or not result.nodes:
+            return []
+        scores = result.similarities or []
+        pairs = list(zip(result.nodes, scores or [None] * len(result.nodes)))
+        return [NodeWithScore(node=node, score=score) for node, score in pairs]
+
+    def _combine(
+        self,
+        vector_nodes: List[NodeWithScore],
+        bm25_nodes: List[NodeWithScore],
+    ) -> List[NodeWithScore]:
+        combined: Dict[str, NodeWithScore] = {}
+        node_lookup: Dict[str, NodeWithScore] = {}
+        for node in vector_nodes + bm25_nodes:
+            node_lookup[node.node_id] = node
+
+        embed_scores = {n.node_id: n.score or 0.0 for n in vector_nodes}
+        bm25_scores = {n.node_id: n.score or 0.0 for n in bm25_nodes}
+        embed_norm = self._normalize(embed_scores)
+        bm25_norm = self._normalize(bm25_scores)
+
+        for node_id, base in node_lookup.items():
+            combined_score = 0.0
+            if node_id in embed_norm:
+                combined_score += self._alpha * embed_norm[node_id]
+            if node_id in bm25_norm:
+                combined_score += (1.0 - self._alpha) * bm25_norm[node_id]
+            combined[node_id] = NodeWithScore(node=base.node, score=combined_score)
+
+        ranked = sorted(
+            combined.values(), key=lambda n: n.score or 0.0, reverse=True
+        )
+        return ranked[: self._target_top_k]
+
+    @staticmethod
+    def _normalize(scores: Dict[str, float]) -> Dict[str, float]:
+        if not scores:
+            return {}
+        values = list(scores.values())
+        max_val = max(values)
+        min_val = min(values)
+        if max_val - min_val < 1e-9:
+            return {k: 1.0 for k in scores}
+        return {k: (v - min_val) / (max_val - min_val) for k, v in scores.items()}
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are Socora's civic knowledge assistant. Today's date is: 2025-09-21.\n"
+    "Socora helps municipalities, schools, and local institutions make public records accessible and searchable for the community.\n"
+    "Socora.ai makes this information accessible enabling residents to ask direct questions about their town, school district, or community services.\n"
+    "When you rely on tools, specify precise inputs so they reflect the latest context and time-sensitive needs (for example, use explicit dates, deadlines, and durations).\n"
+    "Answer questions using the indexed civic content. Highlight reliable information that helps residents, administrators, and community stakeholders understand local services, governance, and programs."
+)
+
 
 def _parse_opensearch_options(options: Iterable[str]) -> Dict[str, Any]:
-
-def _parse_metadata_filters(filters: Iterable[str]) -> List[Tuple[str, str]]:
-    parsed: List[Tuple[str, str]] = []
-    for raw in filters:
-        if not raw:
-            continue
-        key, sep, value = raw.partition('=')
-        if sep != '=':
-            raise ValueError(f"Invalid metadata filter '{raw}'. Expected key=value format.")
-        key = key.strip()
-        if not key:
-            raise ValueError(f"Invalid metadata filter '{raw}'. Key cannot be empty.")
-        parsed.append((key, value.strip()))
-    return parsed
-
-
     parsed: Dict[str, Any] = {}
     for raw in options:
         if not raw:
@@ -59,6 +154,7 @@ def _parse_metadata_filters(filters: Iterable[str]) -> List[Tuple[str, str]]:
             raise ValueError(f"Invalid OpenSearch option '{raw}'. Key cannot be empty.")
         parsed[key] = _coerce_value(value.strip())
     return parsed
+
 
 
 def _coerce_value(value: str) -> Any:
@@ -138,7 +234,8 @@ def _create_function_agent(
     similarity_top_k: int,
     system_prompt: str,
     verbose: bool,
-    metadata_filters: Optional[List[Tuple[str, str]]] = None,
+    bm25_top_k: Optional[int] = None,
+    hybrid_alpha: float = 0.6,
 ) -> FunctionAgent:
     llm = Ollama(
         model=ollama_llm_model,
@@ -146,16 +243,13 @@ def _create_function_agent(
         temperature=temperature,
         request_timeout=request_timeout,
     )
-    filters = None
-    if metadata_filters:
-        filters = MetadataFilters(filters=[ExactMatchFilter(key=key, value=value) for key, value in metadata_filters])
-
-    query_engine = index.as_query_engine(
-        llm=llm,
+    hybrid_retriever = _HybridBM25Retriever(
+        index=index,
         similarity_top_k=similarity_top_k,
-        verbose=verbose,
-        filters=filters,
+        bm25_top_k=bm25_top_k or similarity_top_k,
+        alpha=hybrid_alpha,
     )
+    query_engine = RetrieverQueryEngine(retriever=hybrid_retriever)
     tool = QueryEngineTool.from_defaults(
         query_engine=query_engine,
         name="knowledge_base",
@@ -414,19 +508,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--similarity-top-k",
         type=int,
-        default=4,
+        default=50,
         help="Number of top nodes to retrieve for each question.",
     )
     parser.add_argument(
         "--system-prompt",
         default=None,
         help="Optional override for the civic assistant system prompt.",
-    )
-    parser.add_argument(
-        "--metadata-filter",
-        action="append",
-        default=[],
-        help="Restrict retrieval to nodes where metadata key=value (repeatable).",
     )
     parser.add_argument(
         "--show-sources",
@@ -436,7 +524,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-sources",
         type=int,
-        default=3,
+        default=5,
         help="Maximum number of sources to display when --show-sources is set.",
     )
     parser.add_argument(
@@ -448,7 +536,6 @@ def _parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     try:
         args.opensearch_options = _parse_opensearch_options(args.opensearch_option)
-        args.metadata_filters = _parse_metadata_filters(args.metadata_filter)
     except ValueError as exc:
         parser.error(str(exc))
     args.max_sources = max(1, args.max_sources)

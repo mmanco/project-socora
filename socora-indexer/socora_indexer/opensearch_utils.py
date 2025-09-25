@@ -8,7 +8,7 @@ from opensearchpy.exceptions import RequestError
 
 DEFAULT_VECTOR_METHOD = {
     "name": "hnsw",
-    "space_type": "l2",
+    "space_type": "cosinesimil",
     "engine": "lucene",
     "parameters": {"ef_construction": 256, "m": 48},
 }

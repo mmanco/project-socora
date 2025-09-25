@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional, Sequence
 
+import types
+
 import yaml
 from llama_index.core import StorageContext, VectorStoreIndex
 from llama_index.core.node_parser.text import SemanticSplitterNodeParser
@@ -19,7 +21,75 @@ from socora_indexer.opensearch_utils import ensure_opensearch_index
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("opensearch").setLevel(logging.WARNING)
+logging.getLogger("opensearchpy").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+
+async def _close_opensearch_client(vector_client: OpensearchVectorClient) -> None:
+    client = getattr(vector_client, "_os_client", None)
+    if client is not None:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Failed to close OpenSearch client", exc_info=True)
+        else:
+            transport = getattr(client, "transport", None)
+            close = getattr(transport, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Failed to close OpenSearch transport", exc_info=True)
+    async_client = getattr(vector_client, "_os_async_client", None)
+    if async_client is not None:
+        transport = getattr(async_client, "transport", None)
+        if transport is not None:
+            close = getattr(transport, "close", None)
+            if callable(close):
+                try:
+                    maybe = close()
+                    if asyncio.iscoroutine(maybe):
+                        await maybe
+                except Exception:
+                    logger.debug("Failed to close async OpenSearch transport", exc_info=True)
+        close = getattr(async_client, "close", None)
+        if callable(close):
+            try:
+                maybe = close()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except Exception:
+                logger.debug("Failed to close async OpenSearch client", exc_info=True)
+
+
+def _apply_embedding_prefix(
+    embed_model: OllamaEmbedding,
+    *,
+    document_prefix: str,
+    query_prefix: str,
+) -> OllamaEmbedding:
+    """Ensure inputs to the embedding model include the required task prefixes."""
+
+    def _wrap(method, prefix: str):
+        original = method.__func__
+
+        def _prefixed(self, value: str):
+            formatted = original(self, value)
+            formatted = formatted.strip()
+            if formatted.startswith(prefix):
+                return formatted
+            return f"{prefix}{formatted}"
+
+        return types.MethodType(_prefixed, embed_model)
+
+    if document_prefix:
+        embed_model._format_text = _wrap(embed_model._format_text, document_prefix)
+    if query_prefix:
+        embed_model._format_query = _wrap(embed_model._format_query, query_prefix)
+    return embed_model
 
 
 def build_content_index(
@@ -103,6 +173,11 @@ async def build_content_index_async(
         base_url=ollama_base_url,
         embed_batch_size=embed_batch_size,
     )
+    embed_model = _apply_embedding_prefix(
+        embed_model,
+        document_prefix='search_document: ',
+        query_prefix='',
+    )
 
     node_parser = SemanticSplitterNodeParser.from_defaults(
         embed_model=embed_model,
@@ -184,6 +259,7 @@ async def build_content_index_async(
     finally:
         progress.close()
         await _close_ollama_embedding(embed_model)
+        await _close_opensearch_client(vector_client)
 
     worker_note = f" using {chunk_workers} workers" if chunk_workers > 1 else ""
     logger.info(
@@ -280,25 +356,6 @@ class _BackpressureIndexingPipeline:
         return self._pages_indexed, self._nodes_indexed
 
 
-
-async def _close_ollama_embedding(embed_model: OllamaEmbedding) -> None:
-    client = getattr(embed_model, "_client", None)
-    if client is not None:
-        close_fn = getattr(client, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:  # pragma: no cover - best effort cleanup
-                logger.debug("Failed to close Ollama client", exc_info=True)
-    async_client = getattr(embed_model, "_async_client", None)
-    if async_client is not None:
-        aclose_fn = getattr(async_client, "aclose", None)
-        if callable(aclose_fn):
-            try:
-                await aclose_fn()
-            except Exception:  # pragma: no cover - best effort cleanup
-                logger.debug("Failed to close Ollama async client", exc_info=True)
-
 def _document_from_markdown(
     content_path: Path,
     *,
@@ -362,3 +419,6 @@ def _load_markdown_with_front_matter(path: Path) -> tuple[dict[str, Any], str]:
         raise ValueError("Front matter must resolve to a mapping")
 
     return metadata, body.lstrip("\n")
+
+
+

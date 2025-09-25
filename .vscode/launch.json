@@ -202,7 +202,7 @@
       "id": "ollamaChatModel",
       "type": "promptString",
       "description": "Ollama chat model id",
-      "default": "gemma3:12b"
+      "default": "gpt-oss:20b"
     }
   ]
 }

@@ -1,145 +1,143 @@
 from __future__ import annotations
 
-import argparse
-import asyncio
-import logging
-import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import sys
 
 if __package__ in (None, ""):
     sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+import argparse
+import asyncio
+import logging
+import types
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from llama_index.core import StorageContext, VectorStoreIndex
 from llama_index.core.agent.workflow.function_agent import FunctionAgent
 from llama_index.core.agent.workflow.workflow_events import AgentOutput, ToolCallResult
-from llama_index.core.base.base_retriever import BaseRetriever
-from llama_index.core.callbacks.base import CallbackManager
 from llama_index.core.query_engine.retriever_query_engine import RetrieverQueryEngine
+from llama_index.core.base.base_retriever import BaseRetriever
+from llama_index.core.response_synthesizers import ResponseMode
+from llama_index.core.retrievers import QueryFusionRetriever
+from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.tools import QueryEngineTool
 from llama_index.core.vector_stores.types import VectorStoreQueryMode
-from llama_index.core.tools import QueryEngineTool
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.opensearch import (
     OpensearchVectorClient,
     OpensearchVectorStore,
 )
-
 from socora_indexer.opensearch_utils import ensure_opensearch_index
 
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-class _HybridBM25Retriever(BaseRetriever):
-    """Combine embedding and lexical (BM25) retrieval with weighted reranking."""
-
-    def __init__(
-        self,
-        *,
-        index: VectorStoreIndex,
-        similarity_top_k: int,
-        bm25_top_k: int,
-        alpha: float,
-    ) -> None:
-        self._index = index
-        self._vector_retriever = index.as_retriever(similarity_top_k=similarity_top_k)
-        self._vector_store = index.vector_store
-        self._bm25_top_k = max(1, bm25_top_k)
-        self._alpha = max(0.0, min(alpha, 1.0))
-        self._target_top_k = similarity_top_k
-        dim = getattr(self._vector_store, '_dim', 0) or 0
-        self._dummy_embedding = [0.0] * dim
-        callback_manager = getattr(self._vector_retriever, 'callback_manager', None)
-        super().__init__(callback_manager=callback_manager)
-
-    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
-        vector_nodes = self._vector_retriever.retrieve(query_bundle)
-        bm25_nodes = self._bm25_search(query_bundle.query_str)
-        return self._combine(vector_nodes, bm25_nodes)
-
-    async def _aretrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
-        vector_nodes = await self._vector_retriever.aretrieve(query_bundle)
-        bm25_nodes = await self._abm25_search(query_bundle.query_str)
-        return self._combine(vector_nodes, bm25_nodes)
-
-    def _bm25_search(self, query_str: Optional[str]) -> List[NodeWithScore]:
-        if not query_str:
-            return []
-        result = self._vector_store.query(
-            VectorStoreQueryMode.TEXT_SEARCH,
-            query_str,
-            self._dummy_embedding,
-            self._bm25_top_k,
-        )
-        return self._nodes_from_result(result)
-
-    async def _abm25_search(self, query_str: Optional[str]) -> List[NodeWithScore]:
-        if not query_str:
-            return []
-        result = await self._vector_store.aquery(
-            VectorStoreQueryMode.TEXT_SEARCH,
-            query_str,
-            self._dummy_embedding,
-            self._bm25_top_k,
-        )
-        return self._nodes_from_result(result)
-
-    def _nodes_from_result(self, result) -> List[NodeWithScore]:
-        if not result or not result.nodes:
-            return []
-        scores = result.similarities or []
-        pairs = list(zip(result.nodes, scores or [None] * len(result.nodes)))
-        return [NodeWithScore(node=node, score=score) for node, score in pairs]
-
-    def _combine(
-        self,
-        vector_nodes: List[NodeWithScore],
-        bm25_nodes: List[NodeWithScore],
-    ) -> List[NodeWithScore]:
-        combined: Dict[str, NodeWithScore] = {}
-        node_lookup: Dict[str, NodeWithScore] = {}
-        for node in vector_nodes + bm25_nodes:
-            node_lookup[node.node_id] = node
-
-        embed_scores = {n.node_id: n.score or 0.0 for n in vector_nodes}
-        bm25_scores = {n.node_id: n.score or 0.0 for n in bm25_nodes}
-        embed_norm = self._normalize(embed_scores)
-        bm25_norm = self._normalize(bm25_scores)
-
-        for node_id, base in node_lookup.items():
-            combined_score = 0.0
-            if node_id in embed_norm:
-                combined_score += self._alpha * embed_norm[node_id]
-            if node_id in bm25_norm:
-                combined_score += (1.0 - self._alpha) * bm25_norm[node_id]
-            combined[node_id] = NodeWithScore(node=base.node, score=combined_score)
-
-        ranked = sorted(
-            combined.values(), key=lambda n: n.score or 0.0, reverse=True
-        )
-        return ranked[: self._target_top_k]
-
-    @staticmethod
-    def _normalize(scores: Dict[str, float]) -> Dict[str, float]:
-        if not scores:
-            return {}
-        values = list(scores.values())
-        max_val = max(values)
-        min_val = min(values)
-        if max_val - min_val < 1e-9:
-            return {k: 1.0 for k in scores}
-        return {k: (v - min_val) / (max_val - min_val) for k, v in scores.items()}
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Socora's civic knowledge assistant. Today's date is: 2025-09-21.\n"
     "Socora helps municipalities, schools, and local institutions make public records accessible and searchable for the community.\n"
     "Socora.ai makes this information accessible enabling residents to ask direct questions about their town, school district, or community services.\n"
     "When you rely on tools, specify precise inputs so they reflect the latest context and time-sensitive needs (for example, use explicit dates, deadlines, and durations).\n"
+    "Before calling the knowledge_base tool, translate the request into multiple predictive search fragments that mirror how the content is likely written.\n"
+    "Follow these query principles:\n"
+    "- Do not restate the user's words verbatim; infer document-style phrases that express the same mission.\n"
+    "- Emphasize department names, program titles, governing bodies, dates, fiscal periods, and key actions that could appear in headings.\n"
+    "- Provide several varied guesses (e.g., different dates, statuses, or roles) so the retrievers can triangulate the right material.\n"
     "Answer questions using the indexed civic content. Highlight reliable information that helps residents, administrators, and community stakeholders understand local services, governance, and programs."
 )
 
+def _apply_embedding_prefix(
+    embed_model: OllamaEmbedding,
+    *,
+    document_prefix: str,
+    query_prefix: str,
+) -> OllamaEmbedding:
+    """Ensure embedding inputs include the required task prefixes."""
+
+    def _wrap(method, prefix: str):
+        original = method.__func__
+
+        def _prefixed(self, value: str):
+            formatted = original(self, value)
+            formatted = formatted.strip()
+            if formatted.startswith(prefix):
+                return formatted
+            return f"{prefix}{formatted}"
+
+        return types.MethodType(_prefixed, embed_model)
+
+    if document_prefix:
+        embed_model._format_text = _wrap(embed_model._format_text, document_prefix)
+    if query_prefix:
+        embed_model._format_query = _wrap(embed_model._format_query, query_prefix)
+    return embed_model
+
+
+class _OpenSearchBM25Retriever(BaseRetriever):
+    """Lightweight lexical retriever backed by OpenSearch BM25."""
+
+    def __init__(
+        self,
+        *,
+        vector_store: OpensearchVectorStore,
+        similarity_top_k: int,
+    ) -> None:
+        callback_manager = getattr(vector_store, "callback_manager", None)
+        super().__init__(callback_manager=callback_manager)
+        self._vector_store = vector_store
+        self._vector_client = vector_store.client
+        self._similarity_top_k = max(1, similarity_top_k)
+        dim = getattr(self._vector_client, "_dim", 0) or 0
+        self._dummy_embedding = [0.0] * dim
+
+    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        if not query_bundle.query_str:
+            return []
+        result = self._vector_client.query(
+            VectorStoreQueryMode.TEXT_SEARCH,
+            query_bundle.query_str,
+            self._dummy_embedding,
+            self._similarity_top_k,
+        )
+        return self._nodes_from_result(result)
+
+    async def _aretrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        if not query_bundle.query_str:
+            return []
+        try:
+            result = await self._vector_client.aquery(
+                VectorStoreQueryMode.TEXT_SEARCH,
+                query_bundle.query_str,
+                self._dummy_embedding,
+                self._similarity_top_k,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("OpenSearch BM25 async query timed out; retrying synchronously.")
+            result = self._vector_client.query(
+                VectorStoreQueryMode.TEXT_SEARCH,
+                query_bundle.query_str,
+                self._dummy_embedding,
+                self._similarity_top_k,
+            )
+        except Exception as exc:
+            logger.warning("OpenSearch BM25 async query failed (%s); falling back to sync query.", exc)
+            result = self._vector_client.query(
+                VectorStoreQueryMode.TEXT_SEARCH,
+                query_bundle.query_str,
+                self._dummy_embedding,
+                self._similarity_top_k,
+            )
+        return self._nodes_from_result(result)
+
+    @staticmethod
+    def _nodes_from_result(result) -> List[NodeWithScore]:
+        if not result or not getattr(result, "nodes", None):
+            return []
+        scores = result.similarities or []
+        nodes_with_scores: List[NodeWithScore] = []
+        for node, score in zip(result.nodes, scores or [None] * len(result.nodes)):
+            nodes_with_scores.append(NodeWithScore(node=node, score=score))
+        return nodes_with_scores
 
 def _parse_opensearch_options(options: Iterable[str]) -> Dict[str, Any]:
     parsed: Dict[str, Any] = {}
@@ -154,7 +152,6 @@ def _parse_opensearch_options(options: Iterable[str]) -> Dict[str, Any]:
             raise ValueError(f"Invalid OpenSearch option '{raw}'. Key cannot be empty.")
         parsed[key] = _coerce_value(value.strip())
     return parsed
-
 
 
 def _coerce_value(value: str) -> Any:
@@ -187,6 +184,11 @@ def _build_index(
         model_name=ollama_embed_model,
         base_url=ollama_base_url,
         embed_batch_size=embed_batch_size,
+    )
+    embed_model = _apply_embedding_prefix(
+        embed_model,
+        document_prefix='',
+        query_prefix='search_query: ',
     )
 
     client_kwargs = dict(opensearch_options)
@@ -243,17 +245,60 @@ def _create_function_agent(
         temperature=temperature,
         request_timeout=request_timeout,
     )
-    hybrid_retriever = _HybridBM25Retriever(
-        index=index,
-        similarity_top_k=similarity_top_k,
-        bm25_top_k=bm25_top_k or similarity_top_k,
-        alpha=hybrid_alpha,
+    dense_retriever = index.as_retriever(similarity_top_k=similarity_top_k)
+    bm25_target_top_k = bm25_top_k if bm25_top_k is not None else similarity_top_k
+    bm25_results_top_k = max(1, bm25_target_top_k)
+    vector_store = getattr(index, "vector_store", None)
+    bm25_retriever: Optional[BaseRetriever] = None
+    if isinstance(vector_store, OpensearchVectorStore):
+        try:
+            bm25_retriever = _OpenSearchBM25Retriever(
+                vector_store=vector_store,
+                similarity_top_k=bm25_results_top_k,
+            )
+        except Exception as exc:
+            logger.warning("Failed to initialise OpenSearch BM25 retriever: %s", exc)
+    else:
+        logger.warning("Vector store %s is not OpensearchVectorStore; defaulting to dense retrieval only.", type(vector_store).__name__)
+
+    if bm25_retriever is not None:
+        fusion_query_prompt = (
+            "You rewrite civic knowledge-base searches by predicting {num_queries} document-style queries.\n"
+            "Original request: {query}\n"
+            "Rules:\n"
+            "- Produce exactly {num_queries} distinct queries after the 'Queries:' header; no bullets or numbering.\n"
+            "- Do not repeat the user's wording; infer how matching records are titled or summarised.\n"
+            "- Mix department names, program keywords, dates, and statuses that could realistically appear in civic documents.\n"
+            "- Keep each line concise (<=8 words) and vary phrasing to cover nearby concepts.\n"
+            "Example:\nQueries:\ncapital improvement plan fy2025\nplanning board meeting minutes april 2025\npublic works maintenance schedule 2025\nmunicipal budget hearing recap 2025\n---\n"
+            "Now respond in the same format.\n"
+            "Queries:\n"
+        )
+        fusion_weights = [1.0 - hybrid_alpha, hybrid_alpha]
+        hybrid_retriever = QueryFusionRetriever(
+            retrievers=[bm25_retriever, dense_retriever],
+            retriever_weights=fusion_weights,
+            similarity_top_k=similarity_top_k,
+            num_queries=4,
+            mode=FUSION_MODES.RELATIVE_SCORE,
+            query_gen_prompt=fusion_query_prompt,
+            use_async=False,
+            verbose=verbose,
+            llm=llm,
+        )
+    else:
+        hybrid_retriever = dense_retriever
+
+    query_engine = RetrieverQueryEngine.from_args(
+        retriever=hybrid_retriever,
+        llm=llm,
+        response_mode=ResponseMode.COMPACT,
+        streaming=False,
     )
-    query_engine = RetrieverQueryEngine(retriever=hybrid_retriever)
     tool = QueryEngineTool.from_defaults(
         query_engine=query_engine,
         name="knowledge_base",
-        description="Answer questions using the indexed OpenSearch content.",
+        description="Predictive civic search. Provide multiple short document-style queries that mirror record titles; dense and BM25 signals are fused automatically.",
     )
     return FunctionAgent(
         tools=[tool],
@@ -364,6 +409,8 @@ async def _execute_agent_turn(
         raise
 
     return final_output, tool_events
+
+
 async def _fallback_tool_answer(
     *,
     agent: FunctionAgent,
@@ -512,6 +559,18 @@ def _parse_args() -> argparse.Namespace:
         help="Number of top nodes to retrieve for each question.",
     )
     parser.add_argument(
+        "--bm25-top-k",
+        type=int,
+        default=50,
+        help="Optional override for the number of keyword/BM25 results to consider before reranking.",
+    )
+    parser.add_argument(
+        "--hybrid-alpha",
+        type=float,
+        default=0.6,
+        help="Weight (0-1) for embedding similarity when combining with BM25 scores.",
+    )
+    parser.add_argument(
         "--system-prompt",
         default=None,
         help="Optional override for the civic assistant system prompt.",
@@ -548,6 +607,8 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("opensearch").setLevel(logging.WARNING)
+    logging.getLogger("opensearchpy").setLevel(logging.WARNING)
 
     index = _build_index(
         opensearch_endpoint=args.opensearch_endpoint,
@@ -562,6 +623,8 @@ def main() -> None:
     )
 
     system_prompt = args.system_prompt or DEFAULT_SYSTEM_PROMPT
+    bm25_top_k = args.bm25_top_k or args.similarity_top_k
+    hybrid_alpha = max(0.0, min(args.hybrid_alpha, 1.0))
 
     agent = _create_function_agent(
         index,
@@ -572,6 +635,8 @@ def main() -> None:
         similarity_top_k=args.similarity_top_k,
         system_prompt=system_prompt,
         verbose=args.verbose,
+        bm25_top_k=bm25_top_k,
+        hybrid_alpha=hybrid_alpha,
     )
 
     asyncio.run(
@@ -585,3 +650,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

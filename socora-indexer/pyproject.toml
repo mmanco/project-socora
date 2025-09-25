@@ -8,6 +8,7 @@ dependencies = [
     "llama-index-core>=0.14.2",
     "llama-index-embeddings-ollama>=0.8.3",
     "llama-index-llms-ollama>=0.7.3",
+    "llama-index-retrievers-bm25>=0.6.5",
     "llama-index-vector-stores-opensearch>=0.6.1",
     "pyyaml>=6.0.2",
     "tqdm>=4.67.1",

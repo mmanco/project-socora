@@ -335,6 +335,27 @@ def _create_function_agent(
     )
 
 
+
+def _format_iteration_prefix(iteration_index: int, max_iterations: Optional[int]) -> str:
+    total = "?" if not isinstance(max_iterations, int) or max_iterations <= 0 else str(max_iterations)
+    return f"[Iteration {iteration_index}/{total}]"
+
+
+def _extract_thought_from_output(event: AgentOutput) -> Optional[str]:
+    response = getattr(event, "response", None)
+    if response is None:
+        return None
+    extras = getattr(response, "additional_kwargs", {}) or {}
+    thought = (
+        extras.get("thinking")
+        or extras.get("thought")
+        or extras.get("thinking_delta")
+        or response.content
+    )
+    if not thought:
+        return None
+    return " ".join(str(thought).split())
+
 async def _interactive_chat(agent: FunctionAgent, *, show_sources: bool, max_sources: int) -> None:
     print("Type your questions to chat with the indexed content. Type 'exit' to quit.\n")
 
@@ -414,13 +435,21 @@ async def _execute_agent_turn(
     )
     tool_events: List[ToolCallResult] = []
     final_output: Optional[AgentOutput] = None
+    iteration_index = 0
+    display_limit = max_iterations or getattr(agent, "max_iterations", None)
 
     try:
         async for event in handler.stream_events():
+            if isinstance(event, AgentOutput):
+                if getattr(event, "tool_calls", None):
+                    iteration_index += 1
+                    thought = _extract_thought_from_output(event)
+                    if thought:
+                        prefix = _format_iteration_prefix(iteration_index, display_limit)
+                        print(f"{prefix} Thought: {thought}")
+                final_output = event
             if isinstance(event, ToolCallResult):
                 tool_events.append(event)
-            if isinstance(event, AgentOutput):
-                final_output = event
     except Exception as exc:
         if isinstance(exc, ValueError) and "empty message" in str(exc).lower():
             return None, tool_events

@@ -85,12 +85,16 @@
         "--opensearch-option=${input:opensearchOption}",
         "--embedding-dimension",
         "${input:embeddingDimension}",
+uv         "--chat-provider",
+        "${input:chatProvider}",
         "--ollama-base-url",
         "${input:ollamaBaseUrl}",
         "--ollama-embed-model",
         "${input:ollamaModel}",
-        "--ollama-llm-model",
-        "${input:ollamaChatModel}",
+        "--llm-model",
+        "${input:llmModel}",
+        "--openai-api-key",
+        "${input:openaiApiKey}",
         "--show-sources"
       ]
     }
@@ -199,10 +203,23 @@
       "default": "municipality=Cresskill"
     },
     {
-      "id": "ollamaChatModel",
+      "id": "llmModel",
       "type": "promptString",
-      "description": "Ollama chat model id",
-      "default": "gpt-oss:20b"
+      "description": "Chat model id (defaults applied based on provider when blank)",
+      "default": "llama3"
+    },
+    {
+      "id": "chatProvider",
+      "type": "promptString",
+      "description": "Chat provider (ollama or openai)",
+      "default": "ollama"
+    },
+    {
+      "id": "openaiApiKey",
+      "type": "promptString",
+      "description": "OpenAI API key (leave blank to use OPENAI_API_KEY env)",
+      "default": ""
     }
   ]
 }
+

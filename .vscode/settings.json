@@ -19,7 +19,7 @@
     },
     {
       "path": "socora-indexer",
-      "envManager": "ms-python.python:venv",
+      "envManager": "ms-python.python:system",
       "packageManager": "ms-python.python:pip"
     }
   ],

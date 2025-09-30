@@ -8,6 +8,7 @@ if __package__ in (None, ""):
 
 import argparse
 import asyncio
+import os
 import logging
 import types
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -34,16 +35,18 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are Socora's civic knowledge assistant. Today's date is: 2025-09-21.\n"
+    "You are Socora's civic knowledge assistant.\n"
     "Socora helps municipalities, schools, and local institutions make public records accessible and searchable for the community.\n"
     "Socora.ai makes this information accessible enabling residents to ask direct questions about their town, school district, or community services.\n"
+    "Today's date is: 2025-09-21.\n"
+    "Institution: Cresskill, NJ. Homepage: https://cresskillboro.com\n"
     "When you rely on tools, specify precise inputs so they reflect the latest context and time-sensitive needs (for example, use explicit dates, deadlines, and durations).\n"
     "Before calling the knowledge_base tool, translate the request into multiple predictive search fragments that mirror how the content is likely written.\n"
     "Follow these query principles:\n"
     "- Do not restate the user's words verbatim; infer document-style phrases that express the same mission.\n"
     "- Emphasize department names, program titles, governing bodies, dates, fiscal periods, and key actions that could appear in headings.\n"
     "- Provide several varied guesses (e.g., different dates, statuses, or roles) so the retrievers can triangulate the right material.\n"
-    "Answer questions using the indexed civic content. Highlight reliable information that helps residents, administrators, and community stakeholders understand local services, governance, and programs."
+    "Answer questions using the indexed civic content. Highlight reliable information that helps users, and community stakeholders understand local services, governance, and programs."
 )
 
 def _apply_embedding_prefix(
@@ -229,8 +232,10 @@ def _build_index(
 def _create_function_agent(
     index: VectorStoreIndex,
     *,
+    chat_provider: str,
+    llm_model: Optional[str],
     ollama_base_url: str,
-    ollama_llm_model: str,
+    openai_api_key: Optional[str],
     temperature: float,
     request_timeout: float,
     similarity_top_k: int,
@@ -239,12 +244,33 @@ def _create_function_agent(
     bm25_top_k: Optional[int] = None,
     hybrid_alpha: float = 0.6,
 ) -> FunctionAgent:
-    llm = Ollama(
-        model=ollama_llm_model,
-        base_url=ollama_base_url,
-        temperature=temperature,
-        request_timeout=request_timeout,
-    )
+    provider = (chat_provider or "ollama").strip().lower()
+    default_llm_model = "gpt-4o-mini" if provider == "openai" else "llama3"
+    model_name = llm_model or default_llm_model
+    if provider == "openai":
+        resolved_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        if not resolved_api_key:
+            raise ValueError("OpenAI chat provider selected but no API key supplied via --openai-api-key or OPENAI_API_KEY.")
+        try:
+            from llama_index.llms.openai import OpenAI  # type: ignore
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise ImportError("OpenAI chat provider requires the 'llama-index-llms-openai' package. Install it to continue.") from exc
+        llm = OpenAI(
+            model=model_name,
+            api_key=resolved_api_key,
+            temperature=temperature,
+            timeout=request_timeout,
+        )
+    elif provider == "ollama":
+        llm = Ollama(
+            model=model_name,
+            base_url=ollama_base_url,
+            temperature=temperature,
+            request_timeout=request_timeout,
+        )
+    else:
+        raise ValueError(f"Unsupported chat provider: {chat_provider!r}. Expected 'ollama' or 'openai'.")
+
     dense_retriever = index.as_retriever(similarity_top_k=similarity_top_k)
     bm25_target_top_k = bm25_top_k if bm25_top_k is not None else similarity_top_k
     bm25_results_top_k = max(1, bm25_target_top_k)
@@ -520,6 +546,12 @@ def _parse_args() -> argparse.Namespace:
         help="Embedding dimensionality expected by the OpenSearch index.",
     )
     parser.add_argument(
+        "--chat-provider",
+        choices=["ollama", "openai"],
+        default="ollama",
+        help="Chat model provider to use (ollama or openai).",
+    )
+    parser.add_argument(
         "--ollama-base-url",
         default="http://localhost:11434",
         help="Base URL for the Ollama server.",
@@ -530,9 +562,14 @@ def _parse_args() -> argparse.Namespace:
         help="Ollama embedding model id used during indexing.",
     )
     parser.add_argument(
-        "--ollama-llm-model",
-        default="llama3",
-        help="Ollama chat model id used for answer generation.",
+        "--llm-model",
+        default=None,
+        help="Chat model id (defaults to llama3 for Ollama or gpt-4o-mini for OpenAI).",
+    )
+    parser.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="OpenAI API key (optional; falls back to OPENAI_API_KEY environment variable).",
     )
     parser.add_argument(
         "--embed-batch-size",
@@ -625,11 +662,16 @@ def main() -> None:
     system_prompt = args.system_prompt or DEFAULT_SYSTEM_PROMPT
     bm25_top_k = args.bm25_top_k or args.similarity_top_k
     hybrid_alpha = max(0.0, min(args.hybrid_alpha, 1.0))
+    llm_model = args.llm_model
+    if not llm_model:
+        llm_model = "gpt-4o-mini" if args.chat_provider == "openai" else "llama3"
 
     agent = _create_function_agent(
         index,
+        chat_provider=args.chat_provider,
+        llm_model=llm_model,
         ollama_base_url=args.ollama_base_url,
-        ollama_llm_model=args.ollama_llm_model,
+        openai_api_key=args.openai_api_key,
         temperature=args.temperature,
         request_timeout=args.ollama_request_timeout,
         similarity_top_k=args.similarity_top_k,
